@@ -421,6 +421,7 @@ class AsyncHTTP2Stream:
         self.events: list[
             h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded | h2.events.StreamReset
         ] = []
+        self._opened = False
         self._closed = False
 
     @property
@@ -458,6 +459,7 @@ class AsyncHTTP2Stream:
         ]
 
         self._h2_state.send_headers(self._stream_id, headers, end_stream=end_stream)
+        self._opened = True
         self._h2_state.increment_flow_control_window(2**24, stream_id=self._stream_id)
         await self._connection._write_outgoing_data(request)
 
@@ -587,8 +589,7 @@ class AsyncHTTP2Stream:
         return event
 
     async def aclose(self) -> None:
-        if not self._closed:
-            await self._release(flush=True)
+        await self._release(flush=True)
 
     async def _release(self, flush: bool) -> None:
         """
@@ -599,21 +600,27 @@ class AsyncHTTP2Stream:
         cancellation it is queued for the next write, since a blocked socket must not
         hold up the caller. Streams that already completed are closed, and h2 says so.
         """
+        if self._closed:
+            return
         self._closed = True
         connection = self._connection
         kwargs = {"stream_id": self._stream_id}
         async with Trace("response_closed", logger, self._request, kwargs):
-            h2_closed = self._h2_state.state_machine.state == h2.connection.ConnectionState.CLOSED
-            if not connection._connection_error and not h2_closed:
-                try:
-                    self._h2_state.reset_stream(self._stream_id, h2.errors.ErrorCodes.CANCEL)
-                except h2.exceptions.StreamClosedError:
-                    pass
-                else:
-                    if flush:
-                        try:
-                            await connection._write_outgoing_data(self._request)
-                        except (NetworkError, TimeoutException):
-                            # Best effort: the write has already marked the connection as broken.
-                            pass
-            await connection._stream_closed(self._stream_id)
+            try:
+                # A reset h2 refuses would also close the connection, so only ask once the
+                # stream exists. Streams that completed are already closed, and h2 says so.
+                if self._opened and not connection._connection_error:
+                    try:
+                        self._h2_state.reset_stream(self._stream_id, h2.errors.ErrorCodes.CANCEL)
+                    except h2.exceptions.ProtocolError:
+                        pass
+                    else:
+                        if flush:
+                            try:
+                                await connection._write_outgoing_data(self._request)
+                            except (NetworkError, TimeoutException):
+                                # Best effort: the write has already marked the connection as broken.
+                                pass
+            finally:
+                with AsyncShieldCancellation():
+                    await connection._stream_closed(self._stream_id)

@@ -1,3 +1,5 @@
+import typing
+
 import h2.errors
 import h2.settings
 import hpack
@@ -372,6 +374,67 @@ def test_http2_response_closed_early_with_broken_connection() -> None:
             assert response.status == 200
 
         assert not conn.is_available()
+
+
+
+def test_http2_response_iterator_closed_after_response() -> None:
+    """
+    A body iterator left suspended is closed after the response itself. The second
+    close is a no-op.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello,").serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b" world!", flags=["END_STREAM"]).serialize(),
+        ]
+    )
+    with httpcore2.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            body = response.iter_stream()
+            assert next(body) == b"Hello,"
+        body.close()
+
+        assert conn.is_idle()
+
+
+
+def test_http2_request_failing_before_the_stream_is_open() -> None:
+    """
+    A request can fail before h2 has opened its stream, for example in a trace hook.
+    The connection releases the stream's permit all the same.
+    """
+
+    def trace(name: str, info: dict[str, typing.Any]) -> None:
+        if name == "http2.send_request_headers.started":
+            raise RuntimeError("Rejected by the trace hook")
+
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            # The failed request never opened its stream, so the next one is stream 1.
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]).serialize(),
+        ]
+    )
+    with httpcore2.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(RuntimeError):
+            conn.request("GET", "https://example.com/", extensions={"trace": trace})
+        assert conn.is_idle()
+
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
 
 
 
