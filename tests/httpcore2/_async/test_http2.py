@@ -9,11 +9,14 @@ import httpcore2
 
 def _response_bytes(stream_id: int, body: bytes = b"hello") -> bytes:
     """Encode a five-byte-declared response at the scripted I/O boundary."""
-    return hyperframe.frame.HeadersFrame(
-        stream_id=stream_id,
-        data=hpack.Encoder().encode([(b":status", b"200"), (b"content-length", b"5")]),
-        flags=["END_HEADERS"],
-    ).serialize() + hyperframe.frame.DataFrame(stream_id=stream_id, data=body, flags=["END_STREAM"]).serialize()
+    return (
+        hyperframe.frame.HeadersFrame(
+            stream_id=stream_id,
+            data=hpack.Encoder().encode([(b":status", b"200"), (b"content-length", b"5")]),
+            flags=["END_HEADERS"],
+        ).serialize()
+        + hyperframe.frame.DataFrame(stream_id=stream_id, data=body, flags=["END_STREAM"]).serialize()
+    )
 
 
 @pytest.mark.anyio
@@ -29,9 +32,7 @@ def _response_bytes(stream_id: int, body: bytes = b"hello") -> bytes:
 async def test_http2_failed_connection_releases_pool_slot(
     monkeypatch: pytest.MonkeyPatch, failure: str, expected: type[Exception]
 ) -> None:
-    backend = httpcore2.AsyncMockBackend(
-        [hyperframe.frame.SettingsFrame().serialize(), _response_bytes(1)], http2=True
-    )
+    backend = httpcore2.AsyncMockBackend([hyperframe.frame.SettingsFrame().serialize(), _response_bytes(1)], http2=True)
     async with httpcore2.AsyncConnectionPool(
         network_backend=backend, max_connections=1, http1=False, http2=True
     ) as pool:
@@ -58,9 +59,7 @@ async def test_http2_failed_connection_releases_pool_slot(
         assert pool.connections == []
         assert stream._closed
 
-        recovered = await pool.request(
-            "GET", "http://example.com/recovered", extensions={"timeout": {"pool": 0.1}}
-        )
+        recovered = await pool.request("GET", "http://example.com/recovered", extensions={"timeout": {"pool": 0.1}})
         assert recovered.status == 200
         assert recovered.content == b"hello"
         assert len(pool.connections) == 1
@@ -98,9 +97,7 @@ async def test_http2_exhausted_ids_close_after_last_response() -> None:
     last_stream_id = 2**31 - 1
     stream = httpcore2.AsyncMockStream(
         [
-            hyperframe.frame.SettingsFrame(
-                settings={h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 2}
-            ).serialize(),
+            hyperframe.frame.SettingsFrame(settings={h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 2}).serialize(),
             _response_bytes(last_stream_id),
         ]
     )
