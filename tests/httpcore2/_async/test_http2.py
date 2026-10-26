@@ -10,15 +10,11 @@ import httpcore2
 @pytest.mark.anyio
 @pytest.mark.parametrize("coalesced", [False, True])
 @pytest.mark.parametrize("content_length, body", [(5, b"ab"), (2, b"abc")])
-async def test_http2_invalid_response_content_length(
-    coalesced: bool, content_length: int, body: bytes
-) -> None:
+async def test_http2_invalid_response_content_length(coalesced: bool, content_length: int, body: bytes) -> None:
     """Peer length errors remain transport errors before and after response headers."""
     headers = hyperframe.frame.HeadersFrame(
         stream_id=1,
-        data=hpack.Encoder().encode(
-            [(b":status", b"200"), (b"content-length", str(content_length).encode())]
-        ),
+        data=hpack.Encoder().encode([(b":status", b"200"), (b"content-length", str(content_length).encode())]),
         flags=["END_HEADERS"],
     ).serialize()
     data = hyperframe.frame.DataFrame(stream_id=1, data=body, flags=["END_STREAM"]).serialize()
