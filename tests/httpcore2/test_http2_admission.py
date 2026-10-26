@@ -329,6 +329,29 @@ async def test_cancelled_zero_reader_keeps_waiting_request_active() -> None:
         assert stream.requests == 2
 
 
+@pytest.mark.anyio
+async def test_capacity_waiter_observes_local_connection_closure() -> None:
+    """A capacity waiter must wake when another task closes the connection."""
+    stream = ControlledPeer(1)
+    origin = httpcore2.Origin(b"https", b"example.test", 443)
+    done = anyio.Event()
+
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream) as connection:
+        async with connection.stream("GET", "https://example.test/active"):
+
+            async def queued() -> None:
+                with pytest.raises(httpcore2.ConnectionNotAvailable):
+                    await connection.request("GET", "https://example.test/queued")
+                done.set()
+
+            with anyio.fail_after(2):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(queued)
+                    await anyio.wait_all_tasks_blocked()
+                    await connection.aclose()
+                    await done.wait()
+
+
 class FailingPausedPeer(httpcore2.AsyncMockStream):
     """Answer one complete request, pause admission, then fail the next read."""
 
