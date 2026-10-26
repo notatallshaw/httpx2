@@ -7,6 +7,56 @@ import trio as concurrency
 import httpcore2
 
 
+class RecordingStream(httpcore2.AsyncMockStream):
+    """Retain every buffer the HTTP/2 connection sends to its I/O boundary."""
+
+    def __init__(self, buffer: list[bytes]) -> None:
+        super().__init__(buffer)
+        self.writes: list[bytes] = []
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.writes.append(buffer)
+
+
+@pytest.mark.anyio
+async def test_http2_skips_empty_network_writes() -> None:
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = RecordingStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+        ]
+    )
+
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream) as connection:
+        response = await connection.request("GET", "https://example.com/")
+
+    assert response.status == 200
+    assert response.content == b""
+    assert stream.writes
+    assert all(stream.writes)
+
+
+@pytest.mark.anyio
+async def test_http2_empty_flush_keeps_cached_write_error() -> None:
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = RecordingStream([])
+    connection = httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream)
+    request = httpcore2.Request("GET", "https://example.com/")
+    error = httpcore2.WriteError()
+    connection._write_exception = error
+
+    with pytest.raises(httpcore2.WriteError) as caught:
+        await connection._write_outgoing_data(request)
+
+    assert caught.value is error
+    assert stream.writes == []
+
+
 @pytest.mark.anyio
 async def test_http2_connection() -> None:
     origin = httpcore2.Origin(b"https", b"example.com", 443)
