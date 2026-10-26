@@ -95,10 +95,12 @@ def test_http2_response_closed_twice() -> None:
         ]
     )
     with httpcore2.HTTP2Connection(origin=origin, stream=stream, keepalive_expiry=5.0) as conn:
-        conn.request("GET", "https://example.com/")
+        with conn.stream("GET", "https://example.com/") as response:
+            reservation = next(iter(conn._stream_reservations))
+            response.read()
 
         # The stream was closed when the response completed.
-        conn._response_closed(stream_id=1)
+        conn._response_closed(stream_id=1, reservation=reservation)
 
 
 

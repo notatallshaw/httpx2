@@ -95,10 +95,12 @@ async def test_http2_response_closed_twice() -> None:
         ]
     )
     async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream, keepalive_expiry=5.0) as conn:
-        await conn.request("GET", "https://example.com/")
+        async with conn.stream("GET", "https://example.com/") as response:
+            reservation = next(iter(conn._stream_reservations))
+            await response.aread()
 
         # The stream was closed when the response completed.
-        await conn._response_closed(stream_id=1)
+        await conn._response_closed(stream_id=1, reservation=reservation)
 
 
 @pytest.mark.anyio

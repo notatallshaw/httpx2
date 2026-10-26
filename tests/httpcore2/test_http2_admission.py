@@ -9,8 +9,89 @@ import h2.config
 import h2.connection
 import h2.events
 import h2.settings
-import httpcore2
+import hpack
+import hyperframe.frame
 import pytest
+
+import httpcore2
+
+
+@pytest.mark.anyio
+async def test_overlapping_stream_ids_keep_request_owned_capacity() -> None:
+    """Delayed header traces must not merge separate requests' capacity or cleanup."""
+    stream = httpcore2.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame(settings={h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 2}).serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+        ],
+        http2=True,
+    )
+    scopes = [anyio.CancelScope() for _ in range(4)]
+    started = [anyio.Event() for _ in range(4)]
+    done = [anyio.Event() for _ in range(4)]
+    admitted: list[tuple[int, int]] = []
+    origin = httpcore2.Origin(b"https", b"example.test", 443)
+
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream) as connection:
+        warm = await connection.request("GET", "https://example.test/warm")
+        assert warm.status == 200
+        assert warm.content == b""
+
+        async def request(index: int) -> None:
+            async def trace(name: str, info: dict[str, object]) -> None:
+                if name == "http2.send_request_headers.started":
+                    stream_id = info["stream_id"]
+                    assert isinstance(stream_id, int)
+                    admitted.append((index, stream_id))
+                    started[index].set()
+                    await anyio.sleep_forever()
+
+            with scopes[index]:
+                await connection.request("GET", "https://example.test/held", extensions={"trace": trace})
+            done[index].set()
+
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as group:
+                group.start_soon(request, 0)
+                await started[0].wait()
+                group.start_soon(request, 1)
+                await started[1].wait()
+                group.start_soon(request, 2)
+                await anyio.wait_all_tasks_blocked()
+                assert [index for index, _stream_id in admitted] == [0, 1]
+                reservations_before = connection._stream_reservations.copy()
+
+                scopes[0].cancel()
+                await done[0].wait()
+                await started[2].wait()
+                first_reservation = (reservations_before - connection._stream_reservations).pop()
+                assert [index for index, _stream_id in admitted] == [0, 1, 2]
+                third_id = admitted[2][1]
+                third_events = connection._events[third_id]
+
+                group.start_soon(request, 3)
+                await anyio.wait_all_tasks_blocked()
+                assert [index for index, _stream_id in admitted] == [0, 1, 2]
+                scopes[3].cancel()
+                await done[3].wait()
+
+                scopes[1].cancel()
+                await done[1].wait()
+                assert connection._events[third_id] is third_events
+                assert not connection.is_idle()
+
+                await connection._response_closed(stream_id=admitted[0][1], reservation=first_reservation)
+                assert connection._events[third_id] is third_events
+                assert not connection.is_idle()
+
+                scopes[2].cancel()
+                await done[2].wait()
+
+        assert connection.is_idle()
 
 
 class ControlledPeer(httpcore2.AsyncMockStream):
@@ -201,6 +282,51 @@ async def test_zero_limit_reader_observes_connection_closure(closure: str) -> No
                         stream.publish()
 
                     await done.wait()
+
+
+@pytest.mark.anyio
+async def test_cancelled_zero_reader_keeps_waiting_request_active() -> None:
+    """A cancelled reader must not expire a connection another request is using."""
+    stream = ControlledPeer(1)
+    origin = httpcore2.Origin(b"https", b"example.test", 443)
+    cancelled = anyio.CancelScope()
+    first_done = anyio.Event()
+    second_done = anyio.Event()
+
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream, keepalive_expiry=0) as connection:
+        async with connection.stream("GET", "https://example.test/first") as first:
+            stream.finish(1, pause=True)
+            assert await first.aread() == b"complete"
+
+        async def first_reader() -> None:
+            with cancelled:
+                await connection.request("GET", "https://example.test/cancelled")
+            first_done.set()
+
+        async def second_reader() -> None:
+            response = await connection.request("GET", "https://example.test/resumed")
+            assert response.status == 200
+            assert response.content == b"resumed"
+            second_done.set()
+
+        with anyio.fail_after(2):
+            async with anyio.create_task_group() as group:
+                group.start_soon(first_reader)
+                await stream.zero_read_started.wait()
+                group.start_soon(second_reader)
+                await anyio.wait_all_tasks_blocked()
+
+                cancelled.cancel()
+                await first_done.wait()
+                await anyio.wait_all_tasks_blocked()
+                assert not connection.is_idle()
+                assert not connection.has_expired()
+
+                stream.resume()
+                await second_done.wait()
+
+        assert connection.is_idle()
+        assert stream.requests == 2
 
 
 class FailingPausedPeer(httpcore2.AsyncMockStream):
