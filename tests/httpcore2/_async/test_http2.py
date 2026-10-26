@@ -8,6 +8,34 @@ import httpcore2
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("coalesced", [False, True])
+@pytest.mark.parametrize("content_length, body", [(5, b"ab"), (2, b"abc")])
+async def test_http2_invalid_response_content_length(
+    coalesced: bool, content_length: int, body: bytes
+) -> None:
+    """Peer length errors remain transport errors before and after response headers."""
+    headers = hyperframe.frame.HeadersFrame(
+        stream_id=1,
+        data=hpack.Encoder().encode(
+            [(b":status", b"200"), (b"content-length", str(content_length).encode())]
+        ),
+        flags=["END_HEADERS"],
+    ).serialize()
+    data = hyperframe.frame.DataFrame(stream_id=1, data=body, flags=["END_STREAM"]).serialize()
+    buffers = [hyperframe.frame.SettingsFrame().serialize()]
+    buffers.extend([headers + data] if coalesced else [headers, data])
+    stream = httpcore2.AsyncMockStream(buffers)
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream) as connection:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            async with connection.stream("GET", "https://example.com/") as response:
+                assert response.status == 200
+                await response.aread()
+        assert not connection.is_available()
+
+
+@pytest.mark.anyio
 async def test_http2_connection() -> None:
     origin = httpcore2.Origin(b"https", b"example.com", 443)
     stream = httpcore2.AsyncMockStream(

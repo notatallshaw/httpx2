@@ -438,7 +438,13 @@ class HTTP2Connection(ConnectionInterface):
         # Apply settings and stream admission limits atomically.
         with ShieldCancellation():
             with self._state_lock:
-                events: list[h2.events.Event] = self._h2_state.receive_data(data)
+                try:
+                    events: list[h2.events.Event] = self._h2_state.receive_data(data)
+                except h2.exceptions.ProtocolError as exc:
+                    error = RemoteProtocolError(exc)
+                    self._read_exception = error
+                    self._connection_error = True
+                    raise error from exc
                 for event in events:
                     if isinstance(event, h2.events.RemoteSettingsChanged):
                         self._receive_remote_settings_change(event)
