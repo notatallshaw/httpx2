@@ -482,7 +482,7 @@ def test_http2_remote_max_streams_update() -> None:
 
 
 
-@pytest.mark.parametrize("limits", [[1], [1, 2], [1, 100], [1, 2, 1]])
+@pytest.mark.parametrize("limits", [[1], [1, 2], [1, 100], [1, 2, 1], [0, 1], [1, 0, 2]])
 def test_http2_remote_max_streams_decrease_below_in_flight(limits: list[int]) -> None:
     origin = httpcore2.Origin(b"https", b"example.com", 443)
     stream = httpcore2.MockStream(
@@ -528,3 +528,37 @@ def test_http2_remote_max_streams_decrease_below_in_flight(limits: list[int]) ->
         assert response_c.status == 200
         assert response_c.content == b"response c"
         assert conn.is_idle()
+
+
+
+def test_http2_temporary_zero_stream_limit_without_active_streams() -> None:
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    response_headers = hpack.Encoder().encode([(b":status", b"200")])
+    stream = httpcore2.MockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            b"".join(
+                [
+                    hyperframe.frame.HeadersFrame(
+                        stream_id=1, data=response_headers, flags=["END_HEADERS"]
+                    ).serialize(),
+                    hyperframe.frame.DataFrame(stream_id=1, data=b"first", flags=["END_STREAM"]).serialize(),
+                    hyperframe.frame.SettingsFrame(
+                        settings={h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 0}
+                    ).serialize(),
+                ]
+            ),
+            hyperframe.frame.SettingsFrame(settings={h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 1}).serialize(),
+            hyperframe.frame.HeadersFrame(stream_id=3, data=response_headers, flags=["END_HEADERS"]).serialize(),
+            hyperframe.frame.DataFrame(stream_id=3, data=b"second", flags=["END_STREAM"]).serialize(),
+        ]
+    )
+
+    with httpcore2.HTTP2Connection(origin=origin, stream=stream) as conn:
+        first = conn.request("GET", "https://example.com/first")
+        assert first.status == 200
+        assert first.content == b"first"
+
+        second = conn.request("GET", "https://example.com/second")
+        assert second.status == 200
+        assert second.content == b"second"

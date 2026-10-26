@@ -16,7 +16,7 @@ import h2.settings
 from .._backends.base import NetworkStream
 from .._exceptions import ConnectionNotAvailable, LocalProtocolError, RemoteProtocolError
 from .._models import Origin, Request, Response
-from .._synchronization import Lock, Semaphore, ShieldCancellation
+from .._synchronization import Event, Lock, ShieldCancellation
 from .._trace import Trace
 from .._utils import safe_iterate
 from .interfaces import ConnectionInterface
@@ -58,6 +58,9 @@ class HTTP2Connection(ConnectionInterface):
         self._sent_connection_init = False
         self._used_all_stream_ids = False
         self._connection_error = False
+        # Admit one request to read the peer's initial SETTINGS.
+        self._max_streams = 1
+        self._streams_changed: Event | None = None
 
         # Mapping from stream ID to response stream events.
         self._events: dict[
@@ -101,36 +104,12 @@ class HTTP2Connection(ConnectionInterface):
 
                 self._sent_connection_init = True
 
-                # Initially start with just 1 until the remote server provides
-                # its max_concurrent_streams value
-                self._max_streams = 1
-
-                # Revoked permits still held by active or queued requests.
-                self._max_streams_deficit = 0
-
-                local_settings_max_streams = self._h2_state.local_settings.max_concurrent_streams
-                self._max_streams_semaphore = Semaphore(local_settings_max_streams)
-
-                for _ in range(local_settings_max_streams - self._max_streams):
-                    self._max_streams_semaphore.acquire()
-
-        # A queued request may receive a permit just before the limit drops.
-        while True:
-            self._max_streams_semaphore.acquire()
-            with ShieldCancellation():
-                with self._state_lock:
-                    if not self._max_streams_deficit:
-                        break
-                    self._max_streams_deficit -= 1
-
         try:
-            stream_id = self._h2_state.get_next_available_stream_id()
-            self._events[stream_id] = []
-        except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
-            self._used_all_stream_ids = True
-            self._request_count -= 1
-            self._max_streams_semaphore.release()
-            raise ConnectionNotAvailable()
+            stream_id = self._acquire_stream_id(request)
+        except BaseException:
+            with ShieldCancellation():
+                self._request_not_admitted()
+            raise
 
         try:
             kwargs = {"request": request, "stream_id": stream_id}
@@ -175,6 +154,48 @@ class HTTP2Connection(ConnectionInterface):
                 raise LocalProtocolError(exc)  # pragma: no cover
 
             raise exc
+
+    def _acquire_stream_id(self, request: Request) -> int:
+        """Reserve stream capacity and keep reading while the peer pauses admission."""
+        while True:
+            with self._state_lock:
+                if self._state == HTTPConnectionState.CLOSED:
+                    raise ConnectionNotAvailable()
+                if len(self._events) < self._max_streams:
+                    try:
+                        stream_id = self._h2_state.get_next_available_stream_id()
+                    except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
+                        self._used_all_stream_ids = True
+                        self._request_count -= 1
+                        raise ConnectionNotAvailable()
+                    self._events[stream_id] = []
+                    return stream_id
+                if self._max_streams == 0:
+                    changed = None
+                else:
+                    if self._streams_changed is None:
+                        self._streams_changed = Event()
+                    changed = self._streams_changed
+
+            if changed is None:
+                self._read_paused_settings(request)
+            else:
+                changed.wait()
+
+    def _read_paused_settings(self, request: Request) -> None:
+        """Read a peer update if admission is still paused after locking."""
+        # A zero limit can leave queued requests as the only available readers.
+        with self._read_lock:
+            if self._max_streams == 0:
+                self._receive_events(request)
+        self._write_outgoing_data(request)
+
+    def _notify_streams_changed(self) -> None:
+        """Wake admission waiters before replacing their notification generation."""
+        changed = self._streams_changed
+        if changed is not None:
+            self._streams_changed = None
+            changed.set()
 
     def _send_connection_init(self, request: Request) -> None:
         """
@@ -370,44 +391,51 @@ class HTTP2Connection(ConnectionInterface):
                 max_concurrent_streams.new_value,
                 self._h2_state.local_settings.max_concurrent_streams,
             )
-            if new_max_streams and new_max_streams != self._max_streams:
-                # Never wait for permits while holding the read lock.
-                while new_max_streams > self._max_streams:
-                    if self._max_streams_deficit > 0:
-                        self._max_streams_deficit -= 1
-                    else:
-                        self._max_streams_semaphore.release()
-                    self._max_streams += 1
-                while new_max_streams < self._max_streams:
-                    if not self._max_streams_semaphore.acquire_if_available():
-                        self._max_streams_deficit += 1
-                    self._max_streams -= 1
+            if new_max_streams != self._max_streams:
+                self._max_streams = new_max_streams
+                self._notify_streams_changed()
 
     def _response_closed(self, stream_id: int) -> None:
         with self._state_lock:
             if stream_id in self._events:
-                if self._max_streams_deficit > 0:
-                    self._max_streams_deficit -= 1
-                else:
-                    self._max_streams_semaphore.release()
                 del self._events[stream_id]
-            if self._connection_terminated and not self._events:
-                self.close()
+                self._notify_streams_changed()
+            close = self._update_unused_state()
 
-            elif self._state == HTTPConnectionState.ACTIVE and not self._events:
-                self._state = HTTPConnectionState.IDLE
-                if self._keepalive_expiry is not None:
-                    now = time.monotonic()
-                    self._expire_at = now + self._keepalive_expiry
-                if self._used_all_stream_ids:  # pragma: no cover
-                    self.close()
+        if close:
+            self._network_stream.close()
+
+    def _request_not_admitted(self) -> None:
+        """Finish a request that failed before registering its stream."""
+        with self._state_lock:
+            close = self._update_unused_state()
+
+        if close:
+            self._network_stream.close()
+
+    def _update_unused_state(self) -> bool:
+        """Update unused state under the state lock and report whether to close I/O."""
+        if self._events:
+            return False
+        if self._connection_terminated or not self.is_available():
+            self._mark_closed()
+            return True
+        if self._state == HTTPConnectionState.ACTIVE:
+            self._state = HTTPConnectionState.IDLE
+            if self._keepalive_expiry is not None:
+                self._expire_at = time.monotonic() + self._keepalive_expiry
+        return False
 
     def close(self) -> None:
-        # Note that this method unilaterally closes the connection, and does
-        # not have any kind of locking in place around it.
+        with self._state_lock:
+            self._mark_closed()
+        self._network_stream.close()
+
+    def _mark_closed(self) -> None:
+        """Publish closure while holding the state lock shared with admission."""
         self._h2_state.close_connection()
         self._state = HTTPConnectionState.CLOSED
-        self._network_stream.close()
+        self._notify_streams_changed()
 
     # Wrappers around network read/write operations...
 
