@@ -238,6 +238,12 @@ class HTTP2Connection(ConnectionInterface):
             ):
                 if event.stream_id in self._streams:
                     self._streams[event.stream_id].events.append(event)
+                elif (
+                    isinstance(event, h2.events.DataReceived)
+                    and self._h2_state.state_machine.state != h2.connection.ConnectionState.CLOSED
+                ):
+                    assert event.flow_controlled_length is not None
+                    self._h2_state.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
 
             elif isinstance(event, h2.events.ConnectionTerminated):
                 self._connection_terminated = event
@@ -610,6 +616,11 @@ class HTTP2Stream:
                 # A reset h2 refuses would also close the connection, so only ask once the
                 # stream exists. Streams that completed are already closed, and h2 says so.
                 if self._opened and not connection._connection_error:
+                    if self._h2_state.state_machine.state != h2.connection.ConnectionState.CLOSED:
+                        for event in self.events:
+                            if isinstance(event, h2.events.DataReceived):
+                                assert event.flow_controlled_length is not None
+                                self._h2_state.acknowledge_received_data(event.flow_controlled_length, self._stream_id)
                     try:
                         self._h2_state.reset_stream(self._stream_id, h2.errors.ErrorCodes.CANCEL)
                     except h2.exceptions.ProtocolError:

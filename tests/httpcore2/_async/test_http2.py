@@ -1,6 +1,9 @@
 import typing
 
+import h2.config
+import h2.connection
 import h2.errors
+import h2.events
 import h2.settings
 import hpack
 import hyperframe.frame
@@ -205,6 +208,61 @@ class AsyncRecordingMockStream(httpcore2.AsyncMockStream):
         self.written += buffer
 
 
+class AsyncFlowControlledPeer(httpcore2.AsyncMockStream):
+    """Serve scripted bodies through a real server-side h2 state machine."""
+
+    # Keep the headers and DATA below one HTTPcore read batch.
+    BUFFERED_BYTES = 63_000
+    FINAL_BODY = b"complete"
+
+    def __init__(self) -> None:
+        super().__init__([], http2=True)
+        self.peer = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False))
+        self.peer.initiate_connection()
+        self.initial_connection_window: int | None = None
+        self.resets = 0
+
+    async def write(  # noqa: ASYNC109 - NetworkStream.write requires a timeout parameter.
+        self, buffer: bytes, timeout: float | None = None
+    ) -> None:
+        del timeout
+        for event in self.peer.receive_data(buffer):
+            if isinstance(event, h2.events.RequestReceived):
+                self.respond(event)
+            elif isinstance(event, h2.events.StreamReset):
+                self.resets += 1
+        if outgoing := self.peer.data_to_send():
+            self._buffer.append(outgoing)
+
+    def respond(self, event: h2.events.RequestReceived) -> None:
+        """Queue headers and as much body as the connection window permits."""
+        path = next(value for key, value in event.headers if key == b":path")
+        final = path == b"/final"
+        body = self.FINAL_BODY if final else b"x" * self.BUFFERED_BYTES
+        if self.initial_connection_window is None:
+            self.initial_connection_window = self.peer.outbound_flow_control_window
+        self.peer.send_headers(
+            event.stream_id,
+            [(b":status", b"200")],
+            end_stream=not body,
+        )
+        position = 0
+        while position < len(body):
+            available = min(
+                self.peer.local_flow_control_window(event.stream_id),
+                self.peer.max_outbound_frame_size,
+                len(body) - position,
+            )
+            if available <= 0:
+                break
+            position += available
+            self.peer.send_data(
+                event.stream_id,
+                body[position - available : position],
+                end_stream=final and position == len(body),
+            )
+
+
 @pytest.mark.anyio
 async def test_http2_connection_with_early_response() -> None:
     """
@@ -339,6 +397,84 @@ async def test_http2_response_closed_early() -> None:
 
         response = await conn.request("GET", "https://example.com/")
         assert response.content == b"Hello, world!"
+
+
+@pytest.mark.anyio
+async def test_http2_response_closed_early_restores_buffered_credit() -> None:
+    """Closing a response returns credit for DATA already queued with its headers."""
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = AsyncFlowControlledPeer()
+
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        async with conn.stream("GET", "https://example.com/abandon-0"):
+            pass
+
+        assert stream.initial_connection_window is not None
+        closes_to_exhaust = stream.initial_connection_window // stream.BUFFERED_BYTES + 1
+        for index in range(1, closes_to_exhaust):
+            async with conn.stream("GET", f"https://example.com/abandon-{index}"):
+                pass
+
+        response = await conn.request("GET", "https://example.com/final")
+
+    assert response.content == stream.FINAL_BODY
+    assert stream.resets == closes_to_exhaust
+
+
+@pytest.mark.anyio
+async def test_http2_close_during_event_dispatch_restores_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DATA read concurrently with close still returns connection credit."""
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    data_frames = [
+        hyperframe.frame.DataFrame(stream_id=1, data=b"a" * 16_000),
+        hyperframe.frame.DataFrame(stream_id=1, data=b"b" * 16_000),
+        hyperframe.frame.DataFrame(stream_id=1, data=b"c" * 8_000),
+    ]
+    stream = AsyncRecordingMockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            b"".join(frame.serialize() for frame in data_frames),
+        ]
+    )
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        increment_window = conn._h2_state.increment_flow_control_window
+
+        def keep_default_connection_window(increment: int, stream_id: int | None = None) -> None:
+            if stream_id is not None:
+                increment_window(increment, stream_id)
+
+        # Keep the protocol's default connection window so the small DATA batch
+        # crosses h2's acknowledgement threshold.
+        monkeypatch.setattr(
+            conn._h2_state,
+            "increment_flow_control_window",
+            keep_default_connection_window,
+        )
+        async with conn.stream("GET", "https://example.com/") as response:
+            read_incoming_data = conn._read_incoming_data
+
+            async def close_during_read(
+                request: httpcore2.Request,
+            ) -> list[h2.events.Event]:
+                events = await read_incoming_data(request)
+                await response.aclose()
+                return events
+
+            monkeypatch.setattr(conn, "_read_incoming_data", close_during_read)
+            with pytest.raises(httpcore2.RemoteProtocolError):
+                await response.aread()
+
+        peer = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False))
+        events = peer.receive_data(bytes(stream.written))
+
+        assert any(isinstance(event, h2.events.WindowUpdated) and event.stream_id == 0 for event in events)
 
 
 @pytest.mark.anyio
