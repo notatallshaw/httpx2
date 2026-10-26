@@ -7,6 +7,113 @@ import trio as concurrency
 import httpcore2
 
 
+def _response_bytes(stream_id: int, body: bytes = b"hello") -> bytes:
+    """Encode a five-byte-declared response at the scripted I/O boundary."""
+    return (
+        hyperframe.frame.HeadersFrame(
+            stream_id=stream_id,
+            data=hpack.Encoder().encode([(b":status", b"200"), (b"content-length", b"5")]),
+            flags=["END_HEADERS"],
+        ).serialize()
+        + hyperframe.frame.DataFrame(stream_id=stream_id, data=body, flags=["END_STREAM"]).serialize()
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failure, expected",
+    [
+        ("malformed", httpcore2.LocalProtocolError),
+        ("eof", httpcore2.RemoteProtocolError),
+        ("read", httpcore2.ReadTimeout),
+        ("write", httpcore2.WriteError),
+    ],
+)
+async def test_http2_failed_connection_releases_pool_slot(
+    monkeypatch: pytest.MonkeyPatch, failure: str, expected: type[Exception]
+) -> None:
+    backend = httpcore2.AsyncMockBackend([hyperframe.frame.SettingsFrame().serialize(), _response_bytes(1)], http2=True)
+    async with httpcore2.AsyncConnectionPool(
+        network_backend=backend, max_connections=1, http1=False, http2=True
+    ) as pool:
+        first = await pool.request("GET", "http://example.com/first")
+        assert first.content == b"hello"
+        stream = first.extensions["network_stream"]
+        assert isinstance(stream, httpcore2.AsyncMockStream)
+
+        async def fail_read(max_bytes: int, timeout: float | None = None) -> bytes:
+            raise httpcore2.ReadTimeout()
+
+        async def fail_write(buffer: bytes, timeout: float | None = None) -> None:
+            raise httpcore2.WriteError()
+
+        if failure == "malformed":
+            stream._buffer.append(_response_bytes(3, b"ab"))
+        elif failure == "read":
+            monkeypatch.setattr(stream, "read", fail_read)
+        elif failure == "write":
+            monkeypatch.setattr(stream, "write", fail_write)
+
+        with pytest.raises(expected):
+            await pool.request("GET", "http://example.com/failed")
+        assert pool.connections == []
+        assert stream._closed
+
+        recovered = await pool.request("GET", "http://example.com/recovered", extensions={"timeout": {"pool": 0.1}})
+        assert recovered.status == 200
+        assert recovered.content == b"hello"
+        assert len(pool.connections) == 1
+
+
+@pytest.mark.anyio
+async def test_http2_healthy_connection_remains_reusable() -> None:
+    backend = httpcore2.AsyncMockBackend(
+        [hyperframe.frame.SettingsFrame().serialize(), _response_bytes(1), _response_bytes(3)], http2=True
+    )
+    async with httpcore2.AsyncConnectionPool(
+        network_backend=backend, max_connections=1, http1=False, http2=True
+    ) as pool:
+        first = await pool.request("GET", "http://example.com/first")
+        connection = pool.connections[0]
+        second = await pool.request("GET", "http://example.com/second")
+        assert first.content == second.content == b"hello"
+        assert pool.connections == [connection]
+        assert connection.is_available()
+
+
+@pytest.mark.anyio
+async def test_http2_local_request_error_keeps_healthy_connection_open() -> None:
+    stream = httpcore2.AsyncMockStream([hyperframe.frame.SettingsFrame().serialize()])
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream) as connection:
+        with pytest.raises(httpcore2.LocalProtocolError):
+            await connection.request("GET", "https://example.com/", headers=[(b":method", b"GET")])
+        assert connection.is_available()
+        assert not stream._closed
+
+
+@pytest.mark.anyio
+async def test_http2_exhausted_ids_close_after_last_response() -> None:
+    last_stream_id = 2**31 - 1
+    stream = httpcore2.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame(settings={h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 2}).serialize(),
+            _response_bytes(last_stream_id),
+        ]
+    )
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    async with httpcore2.AsyncHTTP2Connection(origin=origin, stream=stream) as connection:
+        # Exercise the RFC 9113 stream-ID boundary without billions of requests.
+        connection._h2_state.highest_outbound_stream_id = last_stream_id - 2
+        async with connection.stream("GET", "https://example.com/last") as response:
+            with pytest.raises(httpcore2.ConnectionNotAvailable):
+                await connection.request("GET", "https://example.com/exhausted")
+            assert not connection.is_closed()
+            assert await response.aread() == b"hello"
+        assert connection.is_closed()
+        assert stream._closed
+
+
 @pytest.mark.anyio
 async def test_http2_connection() -> None:
     origin = httpcore2.Origin(b"https", b"example.com", 443)

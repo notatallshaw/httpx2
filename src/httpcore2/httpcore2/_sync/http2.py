@@ -391,7 +391,7 @@ class HTTP2Connection(ConnectionInterface):
                 else:
                     self._max_streams_semaphore.release()
                 del self._events[stream_id]
-            if self._connection_terminated and not self._events:
+            if not self._events and (self._connection_terminated or not self.is_available()):
                 self.close()
 
             elif self._state == HTTPConnectionState.ACTIVE and not self._events:
