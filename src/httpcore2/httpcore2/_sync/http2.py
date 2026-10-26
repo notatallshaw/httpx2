@@ -454,6 +454,8 @@ class HTTP2Connection(ConnectionInterface):
 
             if self._write_exception is not None:
                 raise self._write_exception  # pragma: no cover
+            if not data_to_send:
+                return
 
             try:
                 self._network_stream.write(data_to_send, timeout)

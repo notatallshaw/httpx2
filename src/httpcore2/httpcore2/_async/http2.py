@@ -454,6 +454,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
             if self._write_exception is not None:
                 raise self._write_exception  # pragma: no cover
+            if not data_to_send:
+                return
 
             try:
                 await self._network_stream.write(data_to_send, timeout)
