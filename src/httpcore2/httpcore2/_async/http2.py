@@ -391,7 +391,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 else:
                     await self._max_streams_semaphore.release()
                 del self._events[stream_id]
-            if self._connection_terminated and not self._events:
+            if not self._events and (self._connection_terminated or not self.is_available()):
                 await self.aclose()
 
             elif self._state == HTTPConnectionState.ACTIVE and not self._events:
