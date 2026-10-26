@@ -150,60 +150,6 @@ class AsyncEvent:
                     await self._anyio_event.wait()
 
 
-class AsyncSemaphore:
-    def __init__(self, bound: int) -> None:
-        self._bound = bound
-        self._backend = ""
-
-    def setup(self) -> None:
-        """
-        Detect if we're running under 'asyncio' or 'trio' and create
-        a semaphore with the correct implementation.
-        """
-        self._backend = current_async_library()
-        if self._backend == "trio":
-            self._trio_semaphore = trio.Semaphore(initial_value=self._bound, max_value=self._bound)
-        elif self._backend == "asyncio":
-            self._anyio_semaphore = anyio.Semaphore(initial_value=self._bound, max_value=self._bound, fast_acquire=True)
-
-    async def acquire(self) -> None:
-        if not self._backend:
-            self.setup()
-
-        if self._backend == "trio":
-            await self._trio_semaphore.acquire()
-        elif self._backend == "asyncio":
-            await self._anyio_semaphore.acquire()
-
-    def acquire_if_available(self) -> bool:
-        """
-        Acquire a permit if one is immediately available, without blocking.
-        Returns True if a permit was acquired.
-
-        Like `release()`, this requires `setup()` to have run, which any
-        prior `acquire()` call ensures.
-        """
-        if self._backend == "trio":
-            try:
-                self._trio_semaphore.acquire_nowait()
-            except trio.WouldBlock:
-                return False
-            return True
-        elif self._backend == "asyncio":
-            try:
-                self._anyio_semaphore.acquire_nowait()
-            except anyio.WouldBlock:
-                return False
-            return True
-        return False  # pragma: no cover
-
-    async def release(self) -> None:
-        if self._backend == "trio":
-            self._trio_semaphore.release()
-        elif self._backend == "asyncio":
-            self._anyio_semaphore.release()
-
-
 class AsyncShieldCancellation:
     # For certain portions of our codebase where we're dealing with
     # closing connections during exception handling we want to shield
@@ -306,20 +252,6 @@ class Event:
             timeout = None
         if not self._event.wait(timeout=timeout):
             raise PoolTimeout()  # pragma: no cover
-
-
-class Semaphore:
-    def __init__(self, bound: int) -> None:
-        self._semaphore = threading.Semaphore(value=bound)
-
-    def acquire(self) -> None:
-        self._semaphore.acquire()
-
-    def acquire_if_available(self) -> bool:
-        return self._semaphore.acquire(blocking=False)
-
-    def release(self) -> None:
-        self._semaphore.release()
 
 
 class ShieldCancellation:

@@ -16,7 +16,7 @@ import h2.settings
 from .._backends.base import AsyncNetworkStream
 from .._exceptions import ConnectionNotAvailable, LocalProtocolError, RemoteProtocolError
 from .._models import Origin, Request, Response
-from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
+from .._synchronization import AsyncEvent, AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .._utils import safe_async_iterate
 from .interfaces import AsyncConnectionInterface
@@ -32,6 +32,18 @@ class HTTPConnectionState(enum.IntEnum):
     ACTIVE = 1
     IDLE = 2
     CLOSED = 3
+
+
+_ResponseEvent = h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded | h2.events.StreamReset
+
+
+class _StreamReservation:
+    """Request ownership while waiting for and using stream capacity."""
+
+    __slots__ = ("events",)
+
+    def __init__(self) -> None:
+        self.events: list[_ResponseEvent] = []
 
 
 class AsyncHTTP2Connection(AsyncConnectionInterface):
@@ -58,12 +70,15 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         self._sent_connection_init = False
         self._used_all_stream_ids = False
         self._connection_error = False
+        # Admit one request to read the peer's initial SETTINGS.
+        self._max_streams = 1
+        self._streams_changed: AsyncEvent | None = None
+        # h2 does not reserve an ID until headers are sent.
+        self._stream_reservations: set[_StreamReservation] = set()
+        self._pending_requests: set[_StreamReservation] = set()
 
         # Mapping from stream ID to response stream events.
-        self._events: dict[
-            int,
-            list[h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded | h2.events.StreamReset,],
-        ] = {}
+        self._events: dict[int, list[_ResponseEvent]] = {}
 
         # Connection terminated events are stored as state since
         # we need to handle them for all streams.
@@ -80,57 +95,35 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             # usage, for anyone working directly with httpcore connections.
             raise RuntimeError(f"Attempted to send request to {request.url.origin} on connection to {self._origin}")
 
+        reservation = _StreamReservation()
         async with self._state_lock:
             if self._state in (HTTPConnectionState.ACTIVE, HTTPConnectionState.IDLE):
+                self._pending_requests.add(reservation)
                 self._request_count += 1
                 self._expire_at = None
                 self._state = HTTPConnectionState.ACTIVE
             else:
                 raise ConnectionNotAvailable()
 
-        async with self._init_lock:
-            if not self._sent_connection_init:
-                try:
-                    sci_kwargs = {"request": request}
-                    async with Trace("send_connection_init", logger, request, sci_kwargs):
-                        await self._send_connection_init(**sci_kwargs)
-                except BaseException as exc:
-                    with AsyncShieldCancellation():
-                        await self.aclose()
-                    raise exc
-
-                self._sent_connection_init = True
-
-                # Initially start with just 1 until the remote server provides
-                # its max_concurrent_streams value
-                self._max_streams = 1
-
-                # Revoked permits still held by active or queued requests.
-                self._max_streams_deficit = 0
-
-                local_settings_max_streams = self._h2_state.local_settings.max_concurrent_streams
-                self._max_streams_semaphore = AsyncSemaphore(local_settings_max_streams)
-
-                for _ in range(local_settings_max_streams - self._max_streams):
-                    await self._max_streams_semaphore.acquire()
-
-        # A queued request may receive a permit just before the limit drops.
-        while True:
-            await self._max_streams_semaphore.acquire()
-            with AsyncShieldCancellation():
-                async with self._state_lock:
-                    if not self._max_streams_deficit:
-                        break
-                    self._max_streams_deficit -= 1
-
         try:
-            stream_id = self._h2_state.get_next_available_stream_id()
-            self._events[stream_id] = []
-        except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
-            self._used_all_stream_ids = True
-            self._request_count -= 1
-            await self._max_streams_semaphore.release()
-            raise ConnectionNotAvailable()
+            async with self._init_lock:
+                if not self._sent_connection_init:
+                    try:
+                        sci_kwargs = {"request": request}
+                        async with Trace("send_connection_init", logger, request, sci_kwargs):
+                            await self._send_connection_init(**sci_kwargs)
+                    except BaseException as exc:
+                        with AsyncShieldCancellation():
+                            await self.aclose()
+                        raise exc
+
+                    self._sent_connection_init = True
+
+            stream_id = await self._acquire_stream(request, reservation)
+        except BaseException:
+            with AsyncShieldCancellation():
+                await self._request_not_admitted(reservation)
+            raise
 
         try:
             kwargs = {"request": request, "stream_id": stream_id}
@@ -145,7 +138,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             return Response(
                 status=status,
                 headers=headers,
-                content=HTTP2ConnectionByteStream(self, request, stream_id=stream_id),
+                content=HTTP2ConnectionByteStream(self, request, stream_id, reservation),
                 extensions={
                     "http_version": b"HTTP/2",
                     "network_stream": self._network_stream,
@@ -156,7 +149,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             with AsyncShieldCancellation():
                 kwargs = {"stream_id": stream_id}
                 async with Trace("response_closed", logger, request, kwargs):
-                    await self._response_closed(stream_id=stream_id)
+                    await self._response_closed(stream_id, reservation)
 
             if isinstance(exc, h2.exceptions.ProtocolError):
                 # One case where h2 can raise a protocol error is when a
@@ -175,6 +168,51 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 raise LocalProtocolError(exc)  # pragma: no cover
 
             raise exc
+
+    async def _acquire_stream(self, request: Request, reservation: _StreamReservation) -> int:
+        """Reserve stream capacity and keep reading while the peer pauses admission."""
+        while True:
+            async with self._state_lock:
+                if self._state == HTTPConnectionState.CLOSED:
+                    raise ConnectionNotAvailable()
+                if len(self._stream_reservations) < self._max_streams:
+                    try:
+                        stream_id = self._h2_state.get_next_available_stream_id()
+                    except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
+                        self._used_all_stream_ids = True
+                        self._request_count -= 1
+                        raise ConnectionNotAvailable()
+                    # Keep one owner token from admission through response cleanup.
+                    self._pending_requests.remove(reservation)
+                    self._stream_reservations.add(reservation)
+                    self._events[stream_id] = reservation.events
+                    return stream_id
+                if self._max_streams == 0:
+                    changed = None
+                else:
+                    if self._streams_changed is None:
+                        self._streams_changed = AsyncEvent()
+                    changed = self._streams_changed
+
+            if changed is None:
+                await self._read_paused_settings(request)
+            else:
+                await changed.wait()
+
+    async def _read_paused_settings(self, request: Request) -> None:
+        """Read a peer update if admission is still paused after locking."""
+        # A zero limit can leave queued requests as the only available readers.
+        async with self._read_lock:
+            if self._max_streams == 0:
+                await self._receive_events(request)
+        await self._write_outgoing_data(request)
+
+    def _notify_streams_changed(self) -> None:
+        """Wake admission waiters before replacing their notification generation."""
+        changed = self._streams_changed
+        if changed is not None:
+            self._streams_changed = None
+            changed.set()
 
     async def _send_connection_init(self, request: Request) -> None:
         """
@@ -370,44 +408,55 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 max_concurrent_streams.new_value,
                 self._h2_state.local_settings.max_concurrent_streams,
             )
-            if new_max_streams and new_max_streams != self._max_streams:
-                # Never wait for permits while holding the read lock.
-                while new_max_streams > self._max_streams:
-                    if self._max_streams_deficit > 0:
-                        self._max_streams_deficit -= 1
-                    else:
-                        await self._max_streams_semaphore.release()
-                    self._max_streams += 1
-                while new_max_streams < self._max_streams:
-                    if not self._max_streams_semaphore.acquire_if_available():
-                        self._max_streams_deficit += 1
-                    self._max_streams -= 1
+            if new_max_streams != self._max_streams:
+                self._max_streams = new_max_streams
+                self._notify_streams_changed()
 
-    async def _response_closed(self, stream_id: int) -> None:
+    async def _response_closed(self, stream_id: int, reservation: _StreamReservation) -> None:
         async with self._state_lock:
-            if stream_id in self._events:
-                if self._max_streams_deficit > 0:
-                    self._max_streams_deficit -= 1
-                else:
-                    await self._max_streams_semaphore.release()
-                del self._events[stream_id]
-            if self._connection_terminated and not self._events:
-                await self.aclose()
+            if reservation in self._stream_reservations:
+                self._stream_reservations.remove(reservation)
+                # A later request may own the same not-yet-sent h2 stream ID.
+                if self._events.get(stream_id) is reservation.events:
+                    del self._events[stream_id]
+                self._notify_streams_changed()
+            close = self._update_unused_state()
 
-            elif self._state == HTTPConnectionState.ACTIVE and not self._events:
-                self._state = HTTPConnectionState.IDLE
-                if self._keepalive_expiry is not None:
-                    now = time.monotonic()
-                    self._expire_at = now + self._keepalive_expiry
-                if self._used_all_stream_ids:  # pragma: no cover
-                    await self.aclose()
+        if close:
+            await self._network_stream.aclose()
+
+    async def _request_not_admitted(self, reservation: _StreamReservation) -> None:
+        """Finish a request that failed before registering its stream."""
+        async with self._state_lock:
+            self._pending_requests.discard(reservation)
+            close = self._update_unused_state()
+
+        if close:
+            await self._network_stream.aclose()
+
+    def _update_unused_state(self) -> bool:
+        """Update unused state under the state lock and report whether to close I/O."""
+        if self._pending_requests or self._stream_reservations:
+            return False
+        if self._connection_terminated or not self.is_available():
+            self._mark_closed()
+            return True
+        if self._state == HTTPConnectionState.ACTIVE:
+            self._state = HTTPConnectionState.IDLE
+            if self._keepalive_expiry is not None:
+                self._expire_at = time.monotonic() + self._keepalive_expiry
+        return False
 
     async def aclose(self) -> None:
-        # Note that this method unilaterally closes the connection, and does
-        # not have any kind of locking in place around it.
+        async with self._state_lock:
+            self._mark_closed()
+        await self._network_stream.aclose()
+
+    def _mark_closed(self) -> None:
+        """Publish closure while holding the state lock shared with admission."""
         self._h2_state.close_connection()
         self._state = HTTPConnectionState.CLOSED
-        await self._network_stream.aclose()
+        self._notify_streams_changed()
 
     # Wrappers around network read/write operations...
 
@@ -549,9 +598,12 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
 
 class HTTP2ConnectionByteStream:
-    def __init__(self, connection: AsyncHTTP2Connection, request: Request, stream_id: int) -> None:
+    def __init__(
+        self, connection: AsyncHTTP2Connection, request: Request, stream_id: int, reservation: _StreamReservation
+    ) -> None:
         self._connection = connection
         self._request = request
+        self._reservation = reservation
         self._stream_id = stream_id
         self._closed = False
 
@@ -577,4 +629,4 @@ class HTTP2ConnectionByteStream:
             self._closed = True
             kwargs = {"stream_id": self._stream_id}
             async with Trace("response_closed", logger, self._request, kwargs):
-                await self._connection._response_closed(stream_id=self._stream_id)
+                await self._connection._response_closed(self._stream_id, self._reservation)
