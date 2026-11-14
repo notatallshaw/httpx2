@@ -54,6 +54,7 @@ class ASGIWebSocketAsyncNetworkStream:
         self.connection = wsproto.WSConnection(wsproto.ConnectionType.SERVER)
         self.connection.initiate_upgrade_connection(scope["headers"], scope["path"])
         self._aentered = False
+        self._closed = False
 
     async def __aenter__(
         self,
@@ -109,12 +110,18 @@ class ASGIWebSocketAsyncNetworkStream:
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         import httpcore2
 
+        closed_on_entry = self._closed
+
         try:
             message: Message = await self.receive(timeout=timeout)
         except anyio.EndOfStream:
             return b""
         except anyio.ClosedResourceError as exc:
+            # A read already pending when close starts finishes as EOF.
+            if not closed_on_entry and self._closed:
+                return b""
             raise httpcore2.ReadError() from exc
+
         type = message["type"]
 
         if type not in {"websocket.send", "websocket.close"}:
@@ -154,6 +161,8 @@ class ASGIWebSocketAsyncNetworkStream:
                 raise UnhandledWebSocketEvent(event)
 
     async def aclose(self) -> None:
+        self._closed = True
+
         with contextlib.suppress(anyio.ClosedResourceError):
             await self.send({"type": "websocket.disconnect"})
         await self._receive_queue.aclose()
