@@ -7,6 +7,56 @@ from tests.httpcore2 import concurrency
 import httpcore2
 
 
+class RecordingStream(httpcore2.MockStream):
+    """Retain every buffer the HTTP/2 connection sends to its I/O boundary."""
+
+    def __init__(self, buffer: list[bytes]) -> None:
+        super().__init__(buffer)
+        self.writes: list[bytes] = []
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.writes.append(buffer)
+
+
+
+def test_http2_skips_empty_network_writes() -> None:
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = RecordingStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+        ]
+    )
+
+    with httpcore2.HTTP2Connection(origin=origin, stream=stream) as connection:
+        response = connection.request("GET", "https://example.com/")
+
+    assert response.status == 200
+    assert response.content == b""
+    assert stream.writes
+    assert all(stream.writes)
+
+
+
+def test_http2_empty_flush_keeps_cached_write_error() -> None:
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = RecordingStream([])
+    connection = httpcore2.HTTP2Connection(origin=origin, stream=stream)
+    request = httpcore2.Request("GET", "https://example.com/")
+    error = httpcore2.WriteError()
+    connection._write_exception = error
+
+    with pytest.raises(httpcore2.WriteError) as caught:
+        connection._write_outgoing_data(request)
+
+    assert caught.value is error
+    assert stream.writes == []
+
+
 
 def test_http2_connection() -> None:
     origin = httpcore2.Origin(b"https", b"example.com", 443)
@@ -429,6 +479,20 @@ def test_http2_request_to_incorrect_origin() -> None:
     with httpcore2.HTTP2Connection(origin=origin, stream=stream) as conn:
         with pytest.raises(RuntimeError):
             conn.request("GET", "https://other.com/")
+
+
+
+def test_http2_request_without_host_header() -> None:
+    """
+    Requests sent directly to a connection must include a `Host` header,
+    which is used for the `:authority` pseudo-header.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream([])
+    with httpcore2.HTTP2Connection(origin=origin, stream=stream) as conn:
+        request = httpcore2.Request("GET", "https://example.com/")
+        with pytest.raises(httpcore2.LocalProtocolError, match="Missing mandatory Host: header"):
+            conn.handle_request(request)
 
 
 

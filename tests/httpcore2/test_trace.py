@@ -5,6 +5,8 @@ from httpcore2._trace import Trace
 
 
 class UnusableKwargs(dict[str, object]):
+    """Expose an unwanted truthiness check in a disabled trace context."""
+
     def __bool__(self) -> bool:
         raise AssertionError("Disabled tracing inspected its context")
 

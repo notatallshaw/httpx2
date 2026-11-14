@@ -156,6 +156,63 @@ class TestASGIWebSocketAsyncNetworkStream:
 
         assert received == [b""]
 
+    async def test_peer_send_queue_close_is_eof(self, scope: Scope) -> None:
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            await receive()
+
+        async with (
+            create_task_group() as tg,
+            ASGIWebSocketAsyncNetworkStream(app, scope, tg) as (stream, _),
+        ):
+            await stream._send_queue.send_stream.aclose()
+            assert await stream.read(4096) == b""
+
+    async def test_unexpected_receive_queue_close_is_a_read_error(self, scope: Scope) -> None:
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            await receive()
+
+        async with (
+            create_task_group() as tg,
+            ASGIWebSocketAsyncNetworkStream(app, scope, tg) as (stream, _),
+        ):
+            await stream._send_queue.aclose()
+            with pytest.raises(httpcore.ReadError):
+                await stream.read(4096)
+
+    async def test_closed_read_preserves_an_expired_timeout(self, scope: Scope) -> None:
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            await receive()
+
+        async with (
+            create_task_group() as tg,
+            ASGIWebSocketAsyncNetworkStream(app, scope, tg) as (stream, _),
+        ):
+            await stream.aclose()
+            with pytest.raises(TimeoutError):
+                await stream.read(4096, timeout=0)
+
+    async def test_closed_read_preserves_cancellation(self, scope: Scope) -> None:
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            await receive()
+
+        async with (
+            create_task_group() as tg,
+            ASGIWebSocketAsyncNetworkStream(app, scope, tg) as (stream, _),
+        ):
+            await stream.aclose()
+            with anyio.CancelScope() as cancel:
+                cancel.cancel()
+                with pytest.raises(anyio.get_cancelled_exc_class()):
+                    await stream.read(4096)
+
     async def test_read_unhandled_asgi_message(self, scope: Scope) -> None:
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
             await send({"type": "websocket.accept"})
@@ -324,6 +381,33 @@ class TestASGIWebSocketTransport:
                 await stream._receive_queue.send({})
             with pytest.raises(ClosedResourceError):
                 await stream._send_queue.send({})
+
+    async def test_transport_exit_finishes_a_pending_stream_read(
+        self, websocket_request_headers: dict[str, str]
+    ) -> None:
+        async def websocket_endpoint(websocket: WebSocket) -> None:
+            await websocket.accept()
+            await websocket.receive()
+
+        app = Starlette(routes=[WebSocketRoute("/ws", endpoint=websocket_endpoint)])
+        received: list[bytes] = []
+
+        with anyio.fail_after(5):
+            async with create_task_group() as tasks:
+                async with ASGIWebSocketTransport(app=app) as transport:
+                    request = httpx.Request("GET", "ws://localhost/ws", headers=websocket_request_headers)
+                    response = await transport.handle_async_request(request)
+                    stream = response.extensions["network_stream"]
+
+                    async def read() -> None:
+                        received.append(await stream.read(4096))
+
+                    tasks.start_soon(read)
+                    await anyio.wait_all_tasks_blocked()
+
+        assert received == [b""]
+        with pytest.raises(httpcore.ReadError):
+            await stream.read(4096)
 
     async def test_aclose_after_transport_exit_does_not_raise(
         self,
