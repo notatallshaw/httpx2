@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import platform
 import ssl
 from pathlib import Path
@@ -80,6 +81,13 @@ def test_ascii_hash_directory_keeps_its_trust_roots(tmp_path: Path, monkeypatch:
     fallback_file = tmp_path / "fallback.pem"
     unrelated.cert_pem.write_to_path(fallback_file)
 
+    original = os.path.isfile
+
+    def isfile(path: str) -> bool:
+        assert Path(path) != ca_directory / "9d5e43b6.0"
+        return original(path)
+
+    monkeypatch.setattr(os.path, "isfile", isfile)
     context = _context_with_paths(monkeypatch, ca_directory, fallback_file, tmp_path / "missing.pem")
     _client_handshake(context, authority.issue_cert("localhost"))
 
@@ -98,4 +106,35 @@ def test_compiled_ca_file_remains_usable_with_unicode_hash_name(
     (ca_directory / "01234567.\N{ARABIC-INDIC DIGIT ZERO}").write_text("unused")
 
     context = _context_with_paths(monkeypatch, ca_directory, tmp_path / "missing-fallback.pem", compiled_file)
+    _client_handshake(context, authority.issue_cert("localhost"))
+
+
+@pytest.mark.parametrize("layout", ["uppercase", "lowercase-alias", "casefold-lookup", "valid-cafile"])
+def test_uppercase_hash_entry_uses_actual_lowercase_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    authority = trustme.CA(organization_name="HTTPX2 tests", organization_unit_name="hash-directory")
+    ca_directory = tmp_path / "certs"
+    ca_directory.mkdir()
+    lowercase = ca_directory / "9d5e43b6.0"
+    uppercase = lowercase.with_name(lowercase.name.upper())
+    assert uppercase.name != lowercase.name
+    authority.cert_pem.write_to_path(uppercase)
+    fallback = authority if layout in ("uppercase", "valid-cafile") else trustme.CA()
+    fallback_file = tmp_path / "fallback.pem"
+    fallback.cert_pem.write_to_path(fallback_file)
+
+    if layout in ("lowercase-alias", "casefold-lookup") and not lowercase.is_file():
+        lowercase.hardlink_to(uppercase)
+    if layout == "casefold-lookup":
+        original = os.listdir
+
+        def entries(path: str) -> list[str]:
+            # Model a case-insensitive listing; the lowercase alias and TLS are real.
+            return [uppercase.name] if Path(path) == ca_directory else original(path)
+
+        monkeypatch.setattr(os, "listdir", entries)
+
+    compiled_file = fallback_file if layout == "valid-cafile" else tmp_path / "missing.pem"
+    context = _context_with_paths(monkeypatch, ca_directory, fallback_file, compiled_file)
     _client_handshake(context, authority.issue_cert("localhost"))
