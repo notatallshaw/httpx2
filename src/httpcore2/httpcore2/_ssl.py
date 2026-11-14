@@ -16,6 +16,18 @@ CA_FILE_CANDIDATES = [
 ]
 
 
+def _capath_contains_certs(capath: str) -> bool:
+    """Check for a certificate under OpenSSL's lowercase hash lookup."""
+    for name in os.listdir(capath):
+        if not re.fullmatch(r"[0-9a-fA-F]{8}\.[0-9]", name):
+            continue
+        lowercase_name = name.lower()
+        # Preserve case-insensitive paths and lowercase aliases.
+        if name == lowercase_name or os.path.isfile(os.path.join(capath, lowercase_name)):
+            return True
+    return False
+
+
 # `_trust_env` is internal to `httpx2`; drop it with the Linux branch below once sethmlarson/truststore#213 ships.
 def default_ssl_context(*, _trust_env: bool = True) -> ssl.SSLContext:
     if _trust_env and (cafile := os.environ.get("SSL_CERT_FILE")):  # pragma: no cover
@@ -31,7 +43,7 @@ def default_ssl_context(*, _trust_env: bool = True) -> ssl.SSLContext:
     cafile = paths.openssl_cafile if os.path.isfile(paths.openssl_cafile) else None
     capath = paths.openssl_capath if os.path.isdir(paths.openssl_capath) else None
     if capath and not cafile:  # pragma: no cover
-        if not any(re.fullmatch(r"[0-9a-fA-F]{8}\.[0-9]", f) for f in os.listdir(capath)):
+        if not _capath_contains_certs(capath):
             capath = None
     if not cafile and not capath:  # pragma: no cover
         cafile = next(filter(os.path.isfile, CA_FILE_CANDIDATES), None)
