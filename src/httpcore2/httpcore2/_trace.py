@@ -20,8 +20,15 @@ class Trace:
         self.logger = logger
         self.trace_extension = None if request is None else request.extensions.get("trace")
         self.debug = self.logger.isEnabledFor(logging.DEBUG)
+
+        # Subclasses may inspect context fields even when tracing is disabled.
+        if type(self) is Trace and not self.debug and self.trace_extension is None:
+            self.return_value: Any = None
+            self.should_trace = False
+            return
+
         self.kwargs = kwargs or {}
-        self.return_value: Any = None
+        self.return_value = None
         self.should_trace = self.debug or self.trace_extension is not None
         self.prefix = self.logger.name.split(".")[-1]
 
