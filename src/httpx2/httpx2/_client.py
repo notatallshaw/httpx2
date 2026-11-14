@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import enum
 import logging
+import sys
 import time
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Mapping
@@ -24,6 +25,7 @@ from ._config import (
     Limits,
     Proxy,
     Timeout,
+    create_ssl_context,
 )
 from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
@@ -652,6 +654,19 @@ class Client(BaseClient):
 
         allow_env_proxies = trust_env and transport is None
         proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
+
+        if (
+            verify is True
+            and cert is None
+            and transport is None
+            and any(proxy_map.values())
+            and sys.platform == "linux"
+        ):
+            import ssl
+
+            # Injected truststore contexts also own a per-context handshake lock.
+            if ssl.SSLContext.__module__ == "ssl":
+                verify = create_ssl_context(trust_env=trust_env)
 
         self._transport = self._init_transport(
             verify=verify,
@@ -1489,6 +1504,19 @@ class AsyncClient(BaseClient):
 
         allow_env_proxies = trust_env and transport is None
         proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
+
+        if (
+            verify is True
+            and cert is None
+            and transport is None
+            and any(proxy_map.values())
+            and sys.platform == "linux"
+        ):
+            import ssl
+
+            # Injected truststore contexts also own a per-context handshake lock.
+            if ssl.SSLContext.__module__ == "ssl":
+                verify = create_ssl_context(trust_env=trust_env)
 
         self._transport = self._init_transport(
             verify=verify,
