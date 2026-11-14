@@ -22,6 +22,7 @@ from httpx2.websockets._exceptions import WebSocketDisconnect, WebSocketUpgradeE
 from httpx2.websockets._transport import (
     ASGIWebSocketAsyncNetworkStream,
     ASGIWebSocketTransport,
+    Message,
     Receive,
     Scope,
     Send,
@@ -168,6 +169,47 @@ class TestASGIWebSocketAsyncNetworkStream:
         ):
             await stream._send_queue.send_stream.aclose()
             assert await stream.read(4096) == b""
+
+    async def test_close_before_pending_receive_resumes_is_eof(
+        self, scope: Scope, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            await receive()
+            await send({"type": "websocket.accept"})
+            await receive()
+
+        entered = anyio.Event()
+        release = anyio.Event()
+        finished = anyio.Event()
+        received: list[bytes] = []
+
+        with anyio.fail_after(5):
+            async with (
+                create_task_group() as tasks,
+                ASGIWebSocketAsyncNetworkStream(app, scope, tasks) as (stream, _),
+            ):
+                original_receive = stream.receive
+
+                async def receive_after_close(timeout: float | None = None) -> Message:
+                    """Hold the I/O boundary until the real stream is closed."""
+                    entered.set()
+                    await release.wait()
+                    return await original_receive(timeout=timeout)
+
+                async def read() -> None:
+                    received.append(await stream.read(4096))
+                    finished.set()
+
+                monkeypatch.setattr(stream, "receive", receive_after_close)
+                tasks.start_soon(read)
+                await entered.wait()
+                try:
+                    await stream.aclose()
+                finally:
+                    release.set()
+                await finished.wait()
+
+        assert received == [b""]
 
     async def test_unexpected_receive_queue_close_is_a_read_error(self, scope: Scope) -> None:
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
