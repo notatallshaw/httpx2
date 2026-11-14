@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import math
-import typing
+from collections.abc import Awaitable, Callable, Coroutine
 from types import TracebackType
+from typing import Any, Self, cast
 
 import anyio
 import wsproto
@@ -15,11 +16,11 @@ from .._transports.asgi import ASGITransport, _ASGIApp
 from .._types import AsyncByteStream
 from ._exceptions import WebSocketDisconnect, WebSocketUpgradeError
 
-Scope = dict[str, typing.Any]
-Message = dict[str, typing.Any]
-Receive = typing.Callable[[], typing.Awaitable[Message]]
-Send = typing.Callable[[Scope], typing.Coroutine[None, None, None]]
-ASGIApp = typing.Callable[[Scope, Receive, Send], typing.Coroutine[None, None, None]]
+Scope = dict[str, Any]
+Message = dict[str, Any]
+Receive = Callable[[], Awaitable[Message]]
+Send = Callable[[Scope], Coroutine[None, None, None]]
+ASGIApp = Callable[[Scope, Receive, Send], Coroutine[None, None, None]]
 
 
 class ASGIWebSocketTransportError(Exception):
@@ -53,6 +54,7 @@ class ASGIWebSocketAsyncNetworkStream:
         self.connection = wsproto.WSConnection(wsproto.ConnectionType.SERVER)
         self.connection.initiate_upgrade_connection(scope["headers"], scope["path"])
         self._aentered = False
+        self._closed = False
 
     async def __aenter__(
         self,
@@ -108,12 +110,18 @@ class ASGIWebSocketAsyncNetworkStream:
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         import httpcore2
 
+        closed_on_entry = self._closed
+
         try:
             message: Message = await self.receive(timeout=timeout)
         except anyio.EndOfStream:
             return b""
         except anyio.ClosedResourceError as exc:
+            # A read already pending when close starts finishes as EOF.
+            if not closed_on_entry and self._closed:
+                return b""
             raise httpcore2.ReadError() from exc
+
         type = message["type"]
 
         if type not in {"websocket.send", "websocket.close"}:
@@ -153,6 +161,8 @@ class ASGIWebSocketAsyncNetworkStream:
                 raise UnhandledWebSocketEvent(event)
 
     async def aclose(self) -> None:
+        self._closed = True
+
         with contextlib.suppress(anyio.ClosedResourceError):
             await self.send({"type": "websocket.disconnect"})
         await self._receive_queue.aclose()
@@ -209,7 +219,7 @@ class ASGIWebSocketTransport(ASGITransport):
         self._exit_stack: contextlib.AsyncExitStack | None = None
         self._initial_receive_timeout = initial_receive_timeout
 
-    async def __aenter__(self) -> ASGIWebSocketTransport:
+    async def __aenter__(self) -> Self:
         async with contextlib.AsyncExitStack() as stack:
             self._task_group = await stack.enter_async_context(anyio.create_task_group())
             self._exit_stack = stack.pop_all()
@@ -277,9 +287,7 @@ class ASGIWebSocketTransport(ASGITransport):
         stream, accept_response = await self._task_group.start(self._create_asgi_websocket_async_network_stream)
         accept_response_lines = accept_response.decode("utf-8").splitlines()
         headers = [
-            typing.cast(tuple[str, str], line.split(": ", 1))
-            for line in accept_response_lines[1:]
-            if line.strip() != ""
+            cast(tuple[str, str], line.split(": ", 1)) for line in accept_response_lines[1:] if line.strip() != ""
         ]
 
         return Response(
