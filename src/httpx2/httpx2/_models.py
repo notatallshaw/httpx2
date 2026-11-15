@@ -1109,10 +1109,14 @@ class Cookies(MutableMapping[str, str]):
             self.jar = cookies
 
     def extract_cookies(self, response: Response) -> None:
-        """
-        Loads any cookies based on the response `Set-Cookie` headers.
-        """
-        if "set-cookie" not in response.headers and "set-cookie2" not in response.headers:
+        """Apply cookie headers or delegate response processing to a custom jar."""
+        # Custom jars may process responses without standard cookie headers.
+        jar_type = type(self.jar)
+        if (
+            (jar_type is CookieJar or jar_type is IndexedCookieJar)
+            and "set-cookie" not in response.headers
+            and "set-cookie2" not in response.headers
+        ):
             return
 
         urllib_response = self._CookieCompatResponse(response)
