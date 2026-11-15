@@ -188,6 +188,12 @@ class Headers(MutableMapping[str, str]):
         if self._encoding is None:
             for encoding in ["ascii", "utf-8"]:
                 for key, value in self.raw:
+                    if encoding == "ascii" and type(key) is bytes and type(value) is bytes:
+                        # Validate native bytes without allocating discarded strings.
+                        if key.isascii() and value.isascii():
+                            continue
+                        break
+
                     try:
                         key.decode(encoding)
                         value.decode(encoding)

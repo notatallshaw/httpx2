@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from typing_extensions import override
 
 import httpx2
 
@@ -257,3 +258,22 @@ def test_parse_header_links(value: str, expected: list[dict[str, str]]) -> None:
 def test_parse_header_links_no_link() -> None:
     all_links = httpx2.Response(200).links
     assert all_links == {}
+
+
+class UTF8Bytes(bytes):
+    """A supported byte subtype whose decoder requires UTF-8."""
+
+    @override
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        if encoding == "ascii":
+            raise UnicodeDecodeError("ascii", self, 0, 1, "requires UTF-8")
+        return super().decode(encoding, errors)
+
+
+@pytest.mark.parametrize("custom_key", [False, True])
+def test_header_encoding_keeps_byte_subtype_decoder(*, custom_key: bool) -> None:
+    pair = (UTF8Bytes(b"Name"), b"value") if custom_key else (b"Name", UTF8Bytes(b"value"))
+    headers = httpx2.Headers([pair])
+
+    assert headers.encoding == "utf-8"
+    assert headers["name"] == "value"
