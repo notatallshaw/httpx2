@@ -1076,14 +1076,16 @@ class Client(BaseClient):
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
 
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
+        # Logging arguments otherwise decode response fields even when INFO is off.
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                'HTTP Request: %s %s "%s %d %s"',
+                request.method,
+                request.url,
+                response.http_version,
+                response.status_code,
+                response.reason_phrase,
+            )
 
         return response
 
@@ -1914,14 +1916,16 @@ class AsyncClient(BaseClient):
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
 
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
+        # Logging arguments otherwise decode response fields even when INFO is off.
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                'HTTP Request: %s %s "%s %d %s"',
+                request.method,
+                request.url,
+                response.http_version,
+                response.status_code,
+                response.reason_phrase,
+            )
 
         return response
 
