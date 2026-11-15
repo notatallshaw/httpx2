@@ -454,8 +454,12 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         async with self._write_lock:
             data_to_send = self._h2_state.data_to_send()
 
+            # Cached failures take precedence over an empty flush.
             if self._write_exception is not None:
                 raise self._write_exception  # pragma: no cover
+
+            if not data_to_send:
+                return
 
             try:
                 await self._network_stream.write(data_to_send, timeout)
