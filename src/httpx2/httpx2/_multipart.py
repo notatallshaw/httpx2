@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Python 3.15 can defer the MIME tables until a file upload needs them.
+__lazy_modules__ = ("mimetypes",)
+
 import io
 import mimetypes
 import os
