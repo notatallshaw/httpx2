@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import io
+import os
+import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from typing import Any
@@ -8,6 +11,29 @@ from typing import Any
 import pytest
 
 import httpx2
+
+
+def test_mime_tables_load_when_a_file_upload_needs_them() -> None:
+    script = """
+import sys
+import httpx2
+
+request = httpx2.Request("GET", "https://example.com/")
+if sys.version_info >= (3, 15):
+    assert sys.get_lazy_imports() == "normal"
+    assert "mimetypes" not in sys.modules
+else:
+    assert "mimetypes" in sys.modules
+
+request = httpx2.Request(
+    "POST", "https://example.com/", files={"file": ("example.txt", b"contents")}
+)
+assert "mimetypes" in sys.modules
+assert b"Content-Type: text/plain\\r\\n" in request.read()
+"""
+    environment = {name: value for name, value in os.environ.items() if name != "PYTHON_LAZY_IMPORTS"}
+
+    subprocess.run([sys.executable, "-c", script], env=environment, check=True)
 
 
 def echo_request_content(request: httpx2.Request) -> httpx2.Response:
