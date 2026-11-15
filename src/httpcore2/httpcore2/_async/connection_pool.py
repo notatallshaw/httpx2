@@ -8,8 +8,8 @@ from typing import Self
 
 from .._backends.auto import AutoBackend
 from .._backends.base import AsyncNetworkBackend
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
-from .._models import Origin, Proxy, Request, Response
+from .._exceptions import ConnectionNotAvailable, RemoteProtocolError, RequestNotProcessed, UnsupportedProtocol
+from .._models import ByteStream, Origin, Proxy, Request, Response, has_body_headers
 from .._synchronization import AsyncEvent, AsyncShieldCancellation, AsyncThreadLock
 from .._types import SOCKET_OPTION
 from .._utils import safe_async_iterate
@@ -209,6 +209,8 @@ class AsyncConnectionPool(AsyncRequestInterface):
             pool_request = AsyncPoolRequest(request)
             self._requests.append(pool_request)
 
+        request_replayed = False
+
         try:
             while True:
                 with self._optional_thread_lock:
@@ -223,11 +225,16 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 try:
                     # Send the request on the assigned connection.
                     response = await connection.handle_async_request(pool_request.request)
-                except ConnectionNotAvailable:
-                    # In some cases a connection may initially be available to
-                    # handle a request, but then become unavailable.
-                    #
-                    # In this case we clear the connection and try again.
+                except ConnectionNotAvailable as exc:
+                    # Only protocol refusals consume the single automatic replay.
+                    if isinstance(exc, RequestNotProcessed):
+                        # Wrapped or streaming bodies may already be exhausted.
+                        can_replay_body = not has_body_headers(request) or type(request.stream) is ByteStream
+                        if request_replayed or not can_replay_body:
+                            raise RemoteProtocolError(*exc.args) from exc
+                        request_replayed = True
+
+                    # Reassign a refused request or an ordinary assignment race.
                     pool_request.clear_connection()
                 else:
                     break  # pragma: no cover

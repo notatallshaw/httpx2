@@ -1,13 +1,85 @@
 import logging
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
+import h2.settings
 import hpack
 import hyperframe.frame
 import pytest
 import trio as concurrency
+from typing_extensions import override
 
 import httpcore2
+from httpcore2._models import ByteStream
+
+
+class RecordingHTTP2Stream(httpcore2.AsyncMockStream):
+    def __init__(self, buffer: list[bytes]) -> None:
+        super().__init__(buffer, http2=True)
+        self.writes: list[bytes] = []
+
+    @override
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.writes.append(buffer)
+
+
+def http2_requests(stream: RecordingHTTP2Stream) -> list[tuple[int, bytes]]:
+    """Decode client writes to expose stream attempts and their actual bodies."""
+    data = b"".join(stream.writes)
+    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    assert data.startswith(preface)
+    view = memoryview(data[len(preface) :])
+    bodies: dict[int, bytearray] = {}
+    while view:
+        frame, length = hyperframe.frame.Frame.parse_frame_header(view[:9])
+        frame.parse_body(view[9 : 9 + length])
+        if isinstance(frame, hyperframe.frame.HeadersFrame):
+            bodies[frame.stream_id] = bytearray()
+        elif isinstance(frame, hyperframe.frame.DataFrame):
+            bodies[frame.stream_id].extend(frame.data)
+        view = view[9 + length :]
+    return [(stream_id, bytes(body)) for stream_id, body in bodies.items()]
+
+
+class HTTP2SequenceBackend(httpcore2.AsyncMockBackend):
+    """Supply a finite script of real HTTP/2 streams to the actual pool."""
+
+    def __init__(self, buffers: list[list[bytes]]) -> None:
+        super().__init__([], http2=True)
+        self.buffers = iter(buffers)
+        self.streams: list[RecordingHTTP2Stream] = []
+
+    @override
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore2.SOCKET_OPTION] | None = None,
+    ) -> httpcore2.AsyncNetworkStream:
+        buffer = next(self.buffers)
+        stream = RecordingHTTP2Stream(buffer)
+        self.streams.append(stream)
+        return stream
+
+
+def zero_goaway_response() -> list[bytes]:
+    return [
+        hyperframe.frame.SettingsFrame().serialize(),
+        hyperframe.frame.GoAwayFrame(last_stream_id=0, error_code=0).serialize(),
+    ]
+
+
+def successful_http2_response(stream_id: int = 1) -> list[bytes]:
+    return [
+        hyperframe.frame.SettingsFrame().serialize(),
+        hyperframe.frame.HeadersFrame(
+            stream_id=stream_id,
+            data=hpack.Encoder().encode([(b":status", b"200")]),
+            flags=["END_HEADERS", "END_STREAM"],
+        ).serialize(),
+    ]
 
 
 @pytest.mark.anyio
@@ -885,3 +957,239 @@ async def test_connection_pool_multiplexes_idle_http2_connection_within_a_pass()
                 nursery.start_soon(fetch, pool)
 
     assert QueueObservingPool.max_queued_after_pass == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("method", "content"), [("GET", None), ("POST", b"payload")])
+async def test_http2_zero_goaway_retries_unprocessed_request(method: str, content: bytes | None) -> None:
+    backend = HTTP2SequenceBackend([zero_goaway_response(), successful_http2_response()])
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        response = await pool.request(method, "https://example.com/", content=content)
+
+    assert response.status == 200
+    assert response.content == b""
+    assert len(backend.streams) == 2
+    assert all(stream._closed for stream in backend.streams)
+    assert [http2_requests(stream) for stream in backend.streams] == [[(1, content or b"")], [(1, content or b"")]]
+
+
+@pytest.mark.anyio
+async def test_http2_zero_goaway_stops_after_failed_automatic_retry() -> None:
+    # A third connect would exceed the one automatic replay, not exhaust a timer.
+    backend = HTTP2SequenceBackend([zero_goaway_response(), zero_goaway_response()])
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            await pool.request("GET", "https://example.com/")
+
+    assert len(backend.streams) == 2
+    assert all(stream._closed for stream in backend.streams)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [b"100", b"103", b"200"])
+@pytest.mark.parametrize("last_stream_id", [0, 1])
+async def test_http2_goaway_does_not_replay_progressed_response(status: bytes, last_stream_id: int) -> None:
+    progressed = [
+        hyperframe.frame.SettingsFrame().serialize(),
+        hyperframe.frame.HeadersFrame(
+            stream_id=1,
+            data=hpack.Encoder().encode([(b":status", status)]),
+            flags=["END_HEADERS"],
+        ).serialize(),
+        hyperframe.frame.GoAwayFrame(last_stream_id=last_stream_id, error_code=0).serialize(),
+    ]
+    backend = HTTP2SequenceBackend([progressed, successful_http2_response()])
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            await pool.request("POST", "https://example.com/", content=b"payload")
+
+    assert len(backend.streams) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("subclass", [False, True])
+async def test_http2_zero_goaway_does_not_replay_unknown_body(subclass: bool) -> None:
+    class CustomBytes(ByteStream):
+        __slots__ = ()
+
+    async def content() -> AsyncIterator[bytes]:
+        yield b"payload"
+
+    backend = HTTP2SequenceBackend([zero_goaway_response(), successful_http2_response()])
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            if subclass:
+                request = httpcore2.Request(
+                    "POST",
+                    "https://example.com/",
+                    headers=[(b"Host", b"example.com"), (b"Content-Length", b"7")],
+                    content=CustomBytes(b"payload"),
+                )
+                await pool.handle_async_request(request)
+            else:
+                await pool.request("POST", "https://example.com/", content=content())
+
+    assert len(backend.streams) == 1
+
+
+@pytest.mark.anyio
+async def test_http2_zero_goaway_keeps_upload_flow_refusal() -> None:
+    backend = HTTP2SequenceBackend([zero_goaway_response(), successful_http2_response()])
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            # One byte beyond the initial HTTP/2 stream window enters flow waiting.
+            await pool.request("POST", "https://example.com/", content=b"x" * 65536)
+
+    assert len(backend.streams) == 1
+
+
+@pytest.mark.anyio
+async def test_http2_protocol_retry_budget_does_not_bound_assignment_races() -> None:
+    assignment_races = 0
+
+    async def trace(name: str, info: dict[str, Any]) -> None:
+        nonlocal assignment_races
+        if name == "connection.connect_tcp.started" and assignment_races < 2:
+            assignment_races += 1
+            raise httpcore2.ConnectionNotAvailable()
+
+    backend = HTTP2SequenceBackend([zero_goaway_response(), successful_http2_response()])
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        response = await pool.request("GET", "https://example.com/", extensions={"trace": trace})
+
+    assert response.status == 200
+    assert assignment_races == 2
+    assert len(backend.streams) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_http2_positive_goaway_replays_only_repeatable_bodies(streaming: bool) -> None:
+    warmed = [*successful_http2_response(), hyperframe.frame.GoAwayFrame(last_stream_id=1, error_code=0).serialize()]
+    backend = HTTP2SequenceBackend([warmed, successful_http2_response()])
+
+    async def content() -> AsyncIterator[bytes]:
+        yield b"payload"
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        first = await pool.request("GET", "https://example.com/")
+        assert first.status == 200
+
+        if streaming:
+            with pytest.raises(httpcore2.RemoteProtocolError):
+                await pool.request("POST", "https://example.com/next", content=content())
+        else:
+            response = await pool.request("POST", "https://example.com/next", content=b"payload")
+            assert response.status == 200
+
+    assert len(backend.streams) == (1 if streaming else 2)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("method", "content"), [("GET", None), ("POST", b"payload")])
+async def test_http2_refused_stream_retries_on_the_same_connection(method: str, content: bytes | None) -> None:
+    frames = [
+        hyperframe.frame.SettingsFrame().serialize(),
+        hyperframe.frame.RstStreamFrame(stream_id=1, error_code=7).serialize(),
+        *successful_http2_response(stream_id=3)[1:],
+    ]
+    backend = HTTP2SequenceBackend([frames])
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        response = await pool.request(method, "https://example.com/", content=content)
+
+    assert response.status == 200
+    assert len(backend.streams) == 1
+    assert http2_requests(backend.streams[0]) == [(1, content or b""), (3, content or b"")]
+
+
+@pytest.mark.anyio
+async def test_http2_refused_stream_stops_after_failed_automatic_retry() -> None:
+    backend = HTTP2SequenceBackend(
+        [
+            [
+                hyperframe.frame.SettingsFrame().serialize(),
+                hyperframe.frame.RstStreamFrame(stream_id=1, error_code=7).serialize(),
+                hyperframe.frame.RstStreamFrame(stream_id=3, error_code=7).serialize(),
+            ]
+        ]
+    )
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            await pool.request("GET", "https://example.com/")
+
+    assert http2_requests(backend.streams[0]) == [(1, b""), (3, b"")]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("status", "error_code"), [(None, 8), (b"100", 7), (b"103", 7), (b"200", 7)])
+async def test_http2_reset_only_replays_unprocessed_requests(status: bytes | None, error_code: int) -> None:
+    frames = [hyperframe.frame.SettingsFrame().serialize()]
+    if status is not None:
+        frames.append(
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", status)]),
+                flags=["END_HEADERS"],
+            ).serialize()
+        )
+    frames.extend(
+        [
+            hyperframe.frame.RstStreamFrame(stream_id=1, error_code=error_code).serialize(),
+            *successful_http2_response(stream_id=3)[1:],
+        ]
+    )
+    backend = HTTP2SequenceBackend([frames])
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            await pool.request("POST", "https://example.com/", content=b"payload")
+
+    assert http2_requests(backend.streams[0]) == [(1, b"payload")]
+
+
+@pytest.mark.anyio
+async def test_http2_refused_stream_does_not_replay_a_consumed_iterator() -> None:
+    frames = [
+        hyperframe.frame.SettingsFrame().serialize(),
+        hyperframe.frame.RstStreamFrame(stream_id=1, error_code=7).serialize(),
+        *successful_http2_response(stream_id=3)[1:],
+    ]
+    backend = HTTP2SequenceBackend([frames])
+
+    async def content() -> AsyncIterator[bytes]:
+        yield b"payload"
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            await pool.request("POST", "https://example.com/", content=content())
+
+    assert http2_requests(backend.streams[0]) == [(1, b"payload")]
+
+
+@pytest.mark.anyio
+async def test_http2_goaway_retries_unprocessed_stream_beside_progressed_response() -> None:
+    frames = [
+        hyperframe.frame.SettingsFrame(settings={h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 2}).serialize(),
+        hyperframe.frame.HeadersFrame(
+            stream_id=1,
+            data=hpack.Encoder().encode([(b":status", b"200")]),
+            flags=["END_HEADERS"],
+        ).serialize(),
+        hyperframe.frame.GoAwayFrame(last_stream_id=1, error_code=0).serialize(),
+    ]
+    backend = HTTP2SequenceBackend([frames, successful_http2_response()])
+
+    async with httpcore2.AsyncConnectionPool(http2=True, network_backend=backend) as pool:
+        async with pool.stream("POST", "https://example.com/", content=b"payload") as first:
+            assert first.status == 200
+            second = await pool.request("GET", "https://example.com/next")
+            assert second.status == 200
+
+    assert [http2_requests(stream) for stream in backend.streams] == [[(1, b"payload"), (3, b"")], [(1, b"")]]

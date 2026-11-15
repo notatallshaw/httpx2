@@ -9,13 +9,14 @@ from typing import Self
 
 import h2.config
 import h2.connection
+import h2.errors
 import h2.events
 import h2.exceptions
 import h2.settings
 
 from .._backends.base import AsyncNetworkStream
-from .._exceptions import ConnectionNotAvailable, LocalProtocolError, RemoteProtocolError
-from .._models import Origin, Request, Response
+from .._exceptions import ConnectionNotAvailable, LocalProtocolError, RemoteProtocolError, RequestNotProcessed
+from .._models import Origin, Request, Response, has_body_headers
 from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
 from .._trace import Trace
 from .._utils import safe_async_iterate
@@ -24,14 +25,23 @@ from .interfaces import AsyncConnectionInterface
 logger = logging.getLogger("httpcore2.http2")
 
 
-def has_body_headers(request: Request) -> bool:
-    return any(k.lower() == b"content-length" or k.lower() == b"transfer-encoding" for k, _v in request.headers)
-
-
 class HTTPConnectionState(enum.IntEnum):
     ACTIVE = 1
     IDLE = 2
     CLOSED = 3
+
+
+_StreamEvent = h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded | h2.events.StreamReset
+
+
+class _StreamEvents(list[_StreamEvent]):
+    """Keep response progress with the queue's active-stream lifetime."""
+
+    __slots__ = ("response_started",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.response_started = False
 
 
 class AsyncHTTP2Connection(AsyncConnectionInterface):
@@ -60,10 +70,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         self._connection_error = False
 
         # Mapping from stream ID to response stream events.
-        self._events: dict[
-            int,
-            list[h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded | h2.events.StreamReset,],
-        ] = {}
+        self._events: dict[int, _StreamEvents] = {}
 
         # Connection terminated events are stored as state since
         # we need to handle them for all streams.
@@ -125,7 +132,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
         try:
             stream_id = self._h2_state.get_next_available_stream_id()
-            self._events[stream_id] = []
+            self._events[stream_id] = _StreamEvents()
         except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
             self._used_all_stream_ids = True
             self._request_count -= 1
@@ -324,8 +331,12 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 if not self._events.get(stream_id):
                     await self._receive_events(request, stream_id)
             await self._write_outgoing_data(request)
-        event = self._events[stream_id].pop(0)
+        stream_events = self._events[stream_id]
+        event = stream_events.pop(0)
         if isinstance(event, h2.events.StreamReset):
+            if event.error_code == h2.errors.ErrorCodes.REFUSED_STREAM and not stream_events.response_started:
+                self._request_count -= 1
+                raise RequestNotProcessed(event)
             raise RemoteProtocolError(event)
         return event
 
@@ -339,9 +350,16 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         """
         if self._connection_terminated is not None:
             last_stream_id = self._connection_terminated.last_stream_id
-            if stream_id and last_stream_id and stream_id > last_stream_id:
+            stream_events = self._events.get(stream_id) if stream_id is not None else None
+            if (
+                stream_id is not None
+                and last_stream_id is not None
+                and stream_id > last_stream_id
+                and stream_events is not None
+                and not stream_events.response_started
+            ):
                 self._request_count -= 1
-                raise ConnectionNotAvailable()
+                raise RequestNotProcessed(self._connection_terminated)
             raise RemoteProtocolError(self._connection_terminated)
 
         events = await self._read_incoming_data(request)
@@ -359,8 +377,17 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                     h2.events.StreamReset,
                 ),
             ):
-                if event.stream_id in self._events:
-                    self._events[event.stream_id].append(event)
+                stream_events = self._events.get(event.stream_id)
+                if stream_events is not None:
+                    if isinstance(event, h2.events.ResponseReceived):
+                        stream_events.response_started = True
+                    stream_events.append(event)
+
+            elif isinstance(event, h2.events.InformationalResponseReceived):
+                # Interim headers also contradict a later claim of no processing.
+                stream_events = self._events.get(event.stream_id)
+                if stream_events is not None:
+                    stream_events.response_started = True
 
             elif isinstance(event, h2.events.ConnectionTerminated):
                 self._connection_terminated = event

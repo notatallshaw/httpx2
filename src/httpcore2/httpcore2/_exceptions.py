@@ -21,6 +21,10 @@ class ConnectionNotAvailable(Exception):
     pass
 
 
+class RequestNotProcessed(ConnectionNotAvailable):
+    """The peer refused a request before processing it."""
+
+
 class ProxyError(Exception):
     pass
 
