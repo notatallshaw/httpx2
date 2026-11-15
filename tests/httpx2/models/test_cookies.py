@@ -1,10 +1,9 @@
 import http.cookiejar
-from http.client import HTTPResponse
-from urllib.request import Request as UrllibRequest
 
 import pytest
 
 import httpx2
+from httpx2._cookies import IndexedCookieJar
 
 
 def test_cookies() -> None:
@@ -54,24 +53,25 @@ def test_cookies_with_domain_and_path() -> None:
     assert len(cookies) == 0
 
 
-def test_extract_cookies_skips_cookie_jar_without_set_cookie() -> None:
-    class TrackingCookieJar(http.cookiejar.CookieJar):
-        def __init__(self) -> None:
-            super().__init__()
-            self.extract_count = 0
+@pytest.mark.parametrize("jar_type", [http.cookiejar.CookieJar, IndexedCookieJar])
+def test_extract_cookies_skips_standard_jar_without_set_cookie(
+    jar_type: type[http.cookiejar.CookieJar], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[http.cookiejar.CookieJar] = []
 
-        def extract_cookies(self, response: HTTPResponse, request: UrllibRequest) -> None:
-            self.extract_count += 1
+    def extract(jar: http.cookiejar.CookieJar, response: object, request: object) -> None:
+        seen.append(jar)
 
-    jar = TrackingCookieJar()
+    monkeypatch.setattr(http.cookiejar.CookieJar, "extract_cookies", extract)
+    jar = jar_type()
     request = httpx2.Request("GET", "https://www.example.org")
     cookies = httpx2.Cookies(jar)
 
     cookies.extract_cookies(httpx2.Response(200, request=request))
-    assert jar.extract_count == 0
+    assert seen == []
 
     cookies.extract_cookies(httpx2.Response(200, request=request, headers={"Set-Cookie": "name=value"}))
-    assert jar.extract_count == 1
+    assert seen == [jar]
 
 
 def test_set_cookie2() -> None:
