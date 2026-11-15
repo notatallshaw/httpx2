@@ -54,6 +54,9 @@ class AsyncLock:
     In the async case `AsyncLock` provides async locking.
     """
 
+    # Both supported async backends reserve ownership for a queued task.
+    reserves_waiter_turn = True
+
     def __init__(self) -> None:
         self._backend = ""
 
@@ -139,11 +142,18 @@ class AsyncEvent:
         if not self._backend:
             self.setup()
 
+        # Unbounded waits inherit cancellation from their caller.
+        if timeout is None:
+            if self._backend == "trio":
+                await self._trio_event.wait()
+            elif self._backend == "asyncio":
+                await self._anyio_event.wait()
+            return
+
         if self._backend == "trio":
             trio_exc_map: ExceptionMapping = {trio.TooSlowError: PoolTimeout}
-            timeout_or_inf = float("inf") if timeout is None else timeout
             with map_exceptions(trio_exc_map):
-                with trio.fail_after(timeout_or_inf):
+                with trio.fail_after(timeout):
                     await self._trio_event.wait()
         elif self._backend == "asyncio":
             anyio_exc_map: ExceptionMapping = {TimeoutError: PoolTimeout}
@@ -255,6 +265,8 @@ class Lock:
     In the sync case `Lock` provides thread locking.
     In the async case `AsyncLock` provides async locking.
     """
+
+    reserves_waiter_turn = False
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

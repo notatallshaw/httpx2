@@ -17,7 +17,7 @@ import h2.settings
 from .._backends.base import NetworkStream
 from .._exceptions import ConnectionNotAvailable, LocalProtocolError, RemoteProtocolError, RequestNotProcessed
 from .._models import Origin, Request, Response, has_body_headers
-from .._synchronization import Lock, Semaphore, ShieldCancellation
+from .._synchronization import Event, Lock, Semaphore, ShieldCancellation, ThreadLock
 from .._trace import Trace
 from .._utils import safe_iterate
 from .interfaces import ConnectionInterface
@@ -44,6 +44,33 @@ class _StreamEvents(list[_StreamEvent]):
         self.response_started = False
 
 
+class _ReadWaiter:
+    """Track one queued read and an optional signal for readers yielding to it."""
+
+    __slots__ = ("_event", "flow_stream_id", "stream_id")
+
+    def __init__(self, stream_id: int | None, flow_stream_id: int | None) -> None:
+        self.stream_id = stream_id
+        self.flow_stream_id = flow_stream_id
+        self._event: Event | None = None
+
+    @property
+    def event(self) -> Event:
+        event = self._event
+        if event is None:
+            event = self._event = Event()
+        return event
+
+    @property
+    def waiting_stream_id(self) -> int | None:
+        return self.stream_id if self.stream_id is not None else self.flow_stream_id
+
+    def release(self) -> None:
+        """Release readers that yielded to this queued turn."""
+        if self._event is not None:
+            self._event.set()
+
+
 class HTTP2Connection(ConnectionInterface):
     READ_NUM_BYTES = 64 * 1024
     CONFIG = h2.config.H2Configuration(validate_inbound_headers=False)
@@ -64,6 +91,10 @@ class HTTP2Connection(ConnectionInterface):
         self._init_lock = Lock()
         self._state_lock = Lock()
         self._read_lock = Lock()
+        self._read_state_lock = ThreadLock()
+        self._read_waiters: dict[_ReadWaiter, None] = {}
+        self._read_waiters_by_stream: dict[int | None, set[_ReadWaiter]] = {}
+        self._ready_read_waiters: dict[_ReadWaiter, None] = {}
         self._write_lock = Lock()
         self._sent_connection_init = False
         self._used_all_stream_ids = False
@@ -327,9 +358,7 @@ class HTTP2Connection(ConnectionInterface):
         Will read more data from the network if required.
         """
         while not self._events.get(stream_id):
-            with self._read_lock:
-                if not self._events.get(stream_id):
-                    self._receive_events(request, stream_id)
+            self._receive_events(request, stream_id)
             self._write_outgoing_data(request)
         stream_events = self._events[stream_id]
         event = stream_events.pop(0)
@@ -340,14 +369,95 @@ class HTTP2Connection(ConnectionInterface):
             raise RemoteProtocolError(event)
         return event
 
-    def _receive_events(self, request: Request, stream_id: int | None = None) -> None:
-        """
-        Read some data from the network and dispatch the resulting events.
+    def _receive_events(
+        self, request: Request, stream_id: int | None = None, *, flow_stream_id: int | None = None
+    ) -> None:
+        """Read once, yielding the socket to a peer with buffered progress."""
+        waiter = _ReadWaiter(stream_id, flow_stream_id)
+        wait_event: Event | None = None
+        registered = False
+        try:
+            with self._read_state_lock:
+                # A synchronous caller may have been descheduled after its check.
+                if self._stream_is_ready(stream_id, flow_stream_id):
+                    return
+                registered = True
+                self._read_waiters[waiter] = None
+                self._read_waiters_by_stream.setdefault(waiter.waiting_stream_id, set()).add(waiter)
 
-        The caller holds `_read_lock`, re-checks what it is waiting for after
-        acquiring it, since another task may have read it in the meantime, and
-        flushes outgoing data once the lock is released.
-        """
+            with self._read_lock:
+                with self._read_state_lock:
+                    self._remove_read_waiter(waiter)
+                    registered = False
+                    if self._stream_is_ready(stream_id, flow_stream_id):
+                        return
+                    peer = next(iter(self._ready_read_waiters), None)
+                    if peer is not None:
+                        # Do not start unrelated I/O ahead of buffered peer data.
+                        if self._read_lock.reserves_waiter_turn:
+                            return
+                        wait_event = peer.event
+
+                if wait_event is None:
+                    received = self._read_and_dispatch_events(request, stream_id)
+                    with self._read_state_lock:
+                        self._notify_read_waiters(received)
+        finally:
+            if registered:
+                with self._read_state_lock:
+                    self._remove_read_waiter(waiter)
+
+        # The peer must acquire the read lock before this caller can queue again.
+        if wait_event is not None:
+            wait_event.wait()
+
+    def _stream_is_ready(self, stream_id: int | None, flow_stream_id: int | None) -> bool:
+        """Check buffered response events or available outbound stream credit."""
+        return (stream_id is not None and bool(self._events.get(stream_id))) or (
+            flow_stream_id is not None and self._h2_state.local_flow_control_window(flow_stream_id) > 0
+        )
+
+    def _remove_read_waiter(self, waiter: _ReadWaiter) -> None:
+        """Remove a waiter and release readers yielding to it."""
+        self._read_waiters.pop(waiter, None)
+        self._ready_read_waiters.pop(waiter, None)
+        stream_id = waiter.waiting_stream_id
+        stream_waiters = self._read_waiters_by_stream.get(stream_id)
+        if stream_waiters is not None:
+            stream_waiters.discard(waiter)
+            if not stream_waiters:
+                del self._read_waiters_by_stream[stream_id]
+        waiter.release()
+
+    def _notify_read_waiters(self, events: list[h2.events.Event]) -> None:
+        """Remember buffered peers before the next socket read starts."""
+        affected: Iterable[_ReadWaiter]
+
+        for event in events:
+            if isinstance(event, h2.events.RemoteSettingsChanged) or (
+                isinstance(event, h2.events.WindowUpdated) and event.stream_id == 0
+            ):
+                affected = self._read_waiters
+            elif isinstance(
+                event,
+                (
+                    h2.events.ResponseReceived,
+                    h2.events.DataReceived,
+                    h2.events.StreamEnded,
+                    h2.events.StreamReset,
+                    h2.events.WindowUpdated,
+                ),
+            ):
+                affected = self._read_waiters_by_stream.get(event.stream_id, ())
+            else:
+                continue
+
+            for waiter in affected:
+                if self._stream_is_ready(waiter.stream_id, waiter.flow_stream_id):
+                    self._ready_read_waiters[waiter] = None
+
+    def _read_and_dispatch_events(self, request: Request, stream_id: int | None = None) -> list[h2.events.Event]:
+        """Return received events after retaining per-stream response data."""
         if self._connection_terminated is not None:
             last_stream_id = self._connection_terminated.last_stream_id
             stream_events = self._events.get(stream_id) if stream_id is not None else None
@@ -391,6 +501,8 @@ class HTTP2Connection(ConnectionInterface):
 
             elif isinstance(event, h2.events.ConnectionTerminated):
                 self._connection_terminated = event
+
+        return events
 
     def _receive_remote_settings_change(self, event: h2.events.RemoteSettingsChanged) -> None:
         max_concurrent_streams = event.changed_settings.get(h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS)
@@ -518,10 +630,7 @@ class HTTP2Connection(ConnectionInterface):
             flow = min(local_flow, max_frame_size)
             if flow > 0:
                 return flow
-            with self._read_lock:
-                if self._h2_state.local_flow_control_window(stream_id) > 0:
-                    continue
-                self._receive_events(request)
+            self._receive_events(request, flow_stream_id=stream_id)
             self._write_outgoing_data(request)
 
     # Interface for connection pooling...
