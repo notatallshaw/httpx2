@@ -125,6 +125,11 @@ def include_request_headers(
     return headers
 
 
+def has_body_headers(request: Request) -> bool:
+    """Whether the headers announce a body for HTTP framing."""
+    return any(k.lower() == b"content-length" or k.lower() == b"transfer-encoding" for k, _v in request.headers)
+
+
 # Interfaces for byte streams...
 
 
