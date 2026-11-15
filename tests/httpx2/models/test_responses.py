@@ -3,8 +3,9 @@ from __future__ import annotations
 import datetime
 import json
 import pickle
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Generator, Iterator
 
+import anyio
 import chardet
 import pytest
 
@@ -1039,3 +1040,125 @@ def test_response_decode_text_using_explicit_encoding() -> None:
     assert response.reason_phrase == "OK"
     assert response.encoding == "cp1252"
     assert response.text == text
+
+
+@pytest.mark.parametrize("chunk_size", [None, 3])
+def test_iter_raw_closes_after_read_error(chunk_size: int | None) -> None:
+    error = httpx2.ReadError("body read failed")
+
+    def body() -> Iterator[bytes]:
+        yield b"abcdef"
+        raise error
+
+    request = httpx2.Request("GET", "https://example.com")
+    response = httpx2.Response(200, content=body(), request=request)
+
+    with pytest.raises(httpx2.ReadError) as caught:
+        list(response.iter_raw(chunk_size))
+
+    assert caught.value is error
+    assert error.request is request
+    assert response.num_bytes_downloaded == 6
+    assert response.is_closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("chunk_size", [None, 3])
+async def test_aiter_raw_closes_after_read_error(chunk_size: int | None) -> None:
+    error = httpx2.ReadError("body read failed")
+    finished = False
+
+    async def body() -> AsyncIterator[bytes]:
+        nonlocal finished
+        try:
+            yield b"abcdef"
+            raise error
+        finally:
+            finished = True
+
+    request = httpx2.Request("GET", "https://example.com")
+    response = httpx2.Response(200, content=body(), request=request)
+
+    with pytest.raises(httpx2.ReadError) as caught:
+        [part async for part in response.aiter_raw(chunk_size)]
+
+    assert caught.value is error
+    assert error.request is request
+    assert response.num_bytes_downloaded == 6
+    assert response.is_closed
+    assert finished
+
+
+def test_iter_raw_close_closes_response() -> None:
+    response = httpx2.Response(200, content=streaming_body())
+    iterator = response.iter_raw()
+    assert isinstance(iterator, Generator)
+    assert next(iterator) == b"Hello, "
+
+    iterator.close()
+
+    assert response.is_closed
+
+
+@pytest.mark.anyio
+async def test_aiter_raw_close_closes_response() -> None:
+    finished = False
+
+    async def body() -> AsyncIterator[bytes]:
+        nonlocal finished
+        try:
+            yield b"first"
+        finally:
+            finished = True
+
+    response = httpx2.Response(200, content=body())
+    iterator = response.aiter_raw()
+    assert await anext(iterator) == b"first"
+
+    await iterator.aclose()
+
+    assert response.is_closed
+    assert finished
+
+
+@pytest.mark.anyio
+async def test_aiter_raw_doesnt_return_empty_chunks() -> None:
+    async def body() -> AsyncIterator[bytes]:
+        yield b""
+        yield b"first"
+        yield b""
+
+    response = httpx2.Response(200, content=body())
+
+    assert [part async for part in response.aiter_raw()] == [b"first"]
+    assert response.num_bytes_downloaded == 5
+    assert response.is_closed
+
+
+@pytest.mark.anyio
+async def test_cancelled_raw_iteration_closes_generator_and_response() -> None:
+    entered = anyio.Event()
+    finished = anyio.Event()
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            yield b"first"
+            entered.set()
+            await anyio.sleep_forever()
+        finally:
+            finished.set()
+
+    response = httpx2.Response(200, content=body())
+
+    async def read() -> None:
+        async for _ in response.aiter_raw():
+            pass
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(read)
+        await entered.wait()
+        group.cancel_scope.cancel()
+
+    assert finished.is_set()
+    assert response.is_closed
+    assert response.num_bytes_downloaded == 5
